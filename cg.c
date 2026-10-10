@@ -86,6 +86,13 @@ typedef struct Chunk {
     size_t idx;
     Match *m;
     size_t nm, cap, nlines, count;
+    char *out;                 /* plain output formatted by the worker */
+    size_t outlen, line_base;
+    size_t *inv;               /* -v plain path: sparse matching spans, not emitted lines */
+    size_t ninv, rb, re;
+    int vfmt;                  /* worker builds `out` by skipping `inv` */
+    int counted;               /* nlines is final; line_base is set */
+    int prefmt;                /* printer writes `out` and does not format */
     int done;                  /* chunk finished (guarded by mu) */
     int is_open;               /* queue item: "open this file" task */
     struct Chunk *next;
@@ -116,7 +123,7 @@ static int wflag, oflag, bflag, Lflag, rflag, deref, dirskip, nullflag, line_buf
 static int color_on, binmode;      /* binmode: 0 report, 1 text (-a), 2 without-match (-I) */
 static long maxcount = -1, ctxA = -1, ctxB = -1;
 static const char *label;
-static int show_name = -1, store_matches;
+static int show_name = -1, store_matches, plain_prefmt;
 
 /* patterns */
 static char **fx;
@@ -677,7 +684,7 @@ typedef struct {
     char *fbuf; size_t fcap;   /* reusable small-file read buffer */
     DState *ds; int nds;
     uint16_t *tab, init;
-    uint16_t *sflat;                 /* streaming table: next[id<<8|b], '\\n' -> NLV */
+    uint16_t *sflat;                 /* streaming table: next[id<<8|b]; '\\n' is NLV or init */
     uint32_t *mark, *eqmark, gen, eqgen, epoch;
     int *stk, *tmp, *tmp2;
     int *restart; int nrestart;
@@ -764,7 +771,13 @@ static uint16_t intern(Matcher *M, Set *t)
     uint16_t id = (uint16_t)M->nds++;
     DState *d = &M->ds[id];
     memset(d->next, 0xFF, sizeof d->next);
-    if (M->sflat) { memset(M->sflat + ((size_t)id << 8), 0xFF, 256 * sizeof *M->sflat); M->sflat[((size_t)id << 8) | '\n'] = NLV; }
+    if (M->sflat) {
+        memset(M->sflat + ((size_t)id << 8), 0xFF, 256 * sizeof *M->sflat);
+        /* Newline ends the line. A state that is not an end-anchor match restarts
+         * at init (always id 0, including while that state is being created) so
+         * the fast loop does not stop on every line. */
+        M->sflat[((size_t)id << 8) | '\n'] = t->endacc ? (uint16_t)NLV : (M->nds == 1 ? id : M->init);
+    }
     d->n = t->n;
     d->ids = xrealloc(NULL, (size_t)t->n * sizeof(int) + 1);
     memcpy(d->ids, t->ids, (size_t)t->n * sizeof(int));
@@ -2528,12 +2541,13 @@ static int lit_worth(const char *p, size_t n)
 /* ---- interleaved streaming DFA --------------------------------------------
  * The DFA's cost is the load-to-load latency of one state transition per byte.
  * Lines are independent, so four sub-ranges of the chunk are advanced in lock
- * step and the latencies overlap.  Newlines, accepting states and dead states
- * leave the fast loop through TERM.  Matching lines are recorded per stream
- * (the sub-ranges are consecutive, so concatenation is already in file order);
- * -c needs only the count. */
+ * step and the latencies overlap.  A newline restarts a non-end-anchor state
+ * inside the fast loop.  Accepting states, dead states, unknown bytes and
+ * end-anchor newlines still leave through TERM.  Matching lines are recorded
+ * per stream (the sub-ranges are consecutive, so concatenation is already in
+ * file order); -c needs only the count. */
 static int stream_ok;
-typedef struct { size_t p, end, ls; uint16_t s; } Strm;
+typedef struct { size_t p, end, ls, lo; uint16_t s; } Strm;
 typedef struct { size_t *v, n, cap; } MList;       /* pairs: line start, line end */
 static inline void ml_add(MList *l, size_t ls, size_t le)
 {
@@ -2546,6 +2560,37 @@ static inline void s_hit(SCtx *cx, MList *l, size_t ls, size_t le)
     cx->count++;
     if (qflag) _exit(0);
     if (cx->coll) ml_add(l, ls, le);
+}
+/* Four cursors, one byte each per iteration, so the transition latencies overlap.
+ * A TERM result includes that byte, leaves the states at the pre-transition
+ * values, and reports the four results. Kept out of line so the tight loop
+ * is not fighting the rest of stream_range for registers. */
+__attribute__((noinline))
+static size_t dfa4_run(const uint16_t *restrict sf,
+                       const unsigned char *restrict p0, const unsigned char *restrict p1,
+                       const unsigned char *restrict p2, const unsigned char *restrict p3,
+                       uint32_t *s0, uint32_t *s1, uint32_t *s2, uint32_t *s3,
+                       size_t n, int *term,
+                       uint32_t *t0, uint32_t *t1, uint32_t *t2, uint32_t *t3)
+{
+    uint32_t a = *s0, b = *s1, c = *s2, d = *s3;
+    size_t i = 0;
+    for (; i < n; i++) {
+        uint32_t u = sf[(a << 8) | p0[i]];
+        uint32_t v = sf[(b << 8) | p1[i]];
+        uint32_t w = sf[(c << 8) | p2[i]];
+        uint32_t x = sf[(d << 8) | p3[i]];
+        if ((u | v | w | x) & TERM) {
+            *s0 = a; *s1 = b; *s2 = c; *s3 = d;
+            *t0 = u; *t1 = v; *t2 = w; *t3 = x;
+            *term = 1;
+            return i + 1;
+        }
+        a = u; b = v; c = w; d = x;
+    }
+    *s0 = a; *s1 = b; *s2 = c; *s3 = d;
+    *term = 0;
+    return i;
 }
 static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash, SCtx *cx, MList *l)
 {
@@ -2565,22 +2610,32 @@ static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash, SCt
     while (p < x->end) {
         unsigned char b = (unsigned char)d[p++];
         uint16_t t = M->sflat[((size_t)s << 8) | b];
-        if (!(t & TERM)) { s = t; inline_ = 1; continue; }
+        if (!(t & TERM)) {
+            s = t;
+            if (b == '\n') { inline_ = 0; ls = p; } else inline_ = 1;
+            continue;
+        }
         if (t == NLV) {
-            if (M->ds[s].endacc) s_hit(cx, l, ls, p - 1);
+            if (M->ds[s].endacc) s_hit(cx, l, line_start_before(d, x->lo, p - 1), p - 1);
             s = init; inline_ = 0; ls = p; continue;
         }
         if (t == UNK) {
             t = compute(M, s, b);
-            if (!(t & TERM)) { s = t; inline_ = 1; continue; }
+            if (!(t & TERM)) {
+                s = t;
+                if (b == '\n') { inline_ = 0; ls = p; } else inline_ = 1;
+                continue;
+            }
         }
         size_t le = line_end_from(d, p, x->end);
-        if (M->ds[t & ~TERM].accept) s_hit(cx, l, ls, le);
+        if (M->ds[t & ~TERM].accept) s_hit(cx, l, line_start_before(d, x->lo, p), le);
         p = le < x->end ? le + 1 : x->end;
         s = init; inline_ = 0; ls = p;
     }
-    /* last line without a trailing newline */
-    if (inline_ && x->end > 0 && d[x->end - 1] != '\n' && M->ds[s].endacc) s_hit(cx, l, ls, x->end);
+    /* last line without a trailing newline. ls may sit on an earlier line: the
+     * fast path steps over non-anchor newlines without recording them. */
+    if (inline_ && x->end > 0 && d[x->end - 1] != '\n' && M->ds[s].endacc)
+        s_hit(cx, l, line_start_before(d, x->lo, x->end), x->end);
     return 0;
 }
 static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
@@ -2599,7 +2654,7 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
         cut[k] = line_start_at_or_after(d, end, guess);
         if (cut[k] < cut[k - 1]) cut[k] = cut[k - 1];
     }
-    for (int k = 0; k < K; k++) { st[k].p = st[k].ls = cut[k]; st[k].end = cut[k + 1]; st[k].s = init; }
+    for (int k = 0; k < K; k++) { st[k].p = st[k].ls = st[k].lo = cut[k]; st[k].end = cut[k + 1]; st[k].s = init; }
     const uint16_t *sf = M->sflat;
     uint32_t resets = 0;
     int thrash = 0;
@@ -2611,15 +2666,10 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
         const unsigned char *p0 = (const unsigned char *)d + st[0].p, *p1 = (const unsigned char *)d + st[1].p,
                             *p2 = (const unsigned char *)d + st[2].p, *p3 = (const unsigned char *)d + st[3].p;
         uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
-        size_t i = 0;
-        for (; i < n; i++) {
-            t0 = sf[(s0 << 8) | p0[i]]; t1 = sf[(s1 << 8) | p1[i]];
-            t2 = sf[(s2 << 8) | p2[i]]; t3 = sf[(s3 << 8) | p3[i]];
-            if ((t0 | t1 | t2 | t3) & TERM) { i++; break; }
-            s0 = t0; s1 = t1; s2 = t2; s3 = t3;
-        }
+        int term = 0;
+        size_t i = dfa4_run(sf, p0, p1, p2, p3, &s0, &s1, &s2, &s3, n, &term, &t0, &t1, &t2, &t3);
         st[0].p += i; st[1].p += i; st[2].p += i; st[3].p += i;
-        if (!((t0 | t1 | t2 | t3) & TERM)) { st[0].s = (uint16_t)s0; st[1].s = (uint16_t)s1; st[2].s = (uint16_t)s2; st[3].s = (uint16_t)s3; continue; }
+        if (!term) { st[0].s = (uint16_t)s0; st[1].s = (uint16_t)s1; st[2].s = (uint16_t)s2; st[3].s = (uint16_t)s3; continue; }
         uint32_t ss[4] = {s0, s1, s2, s3}, tt[4] = {t0, t1, t2, t3};
         int voided[4] = {0, 0, 0, 0};
         for (int k = 0; k < 4; k++) {
@@ -2629,7 +2679,7 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
             x->s = (uint16_t)ss[k];
             if (!(t & TERM)) { x->s = (uint16_t)t; continue; }
             if (t == NLV) {
-                if (M->ds[x->s].endacc) s_hit(&cx, &ml[k], x->ls, x->p - 1);
+                if (M->ds[x->s].endacc) s_hit(&cx, &ml[k], line_start_before(d, x->lo, x->p - 1), x->p - 1);
                 x->s = init; x->ls = x->p; continue;
             }
             if (t == UNK) {
@@ -2638,7 +2688,10 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
                 uint16_t r = compute(M, x->s, b);
                 if (ep != M->epoch) {                       /* cache was reset: other ids are stale */
                     resets++;
-                    for (int j = 0; j < 4; j++) if (j != k) { st[j].p = st[j].ls; st[j].s = init; voided[j] = 1; }
+                    for (int j = 0; j < 4; j++) {
+                        st[j].ls = line_start_before(d, st[j].lo, st[j].p);
+                        if (j != k) { st[j].p = st[j].ls; st[j].s = init; voided[j] = 1; }
+                    }
                     if (resets > 8) thrash = 1;
                     sf = M->sflat;
                 }
@@ -2647,7 +2700,7 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
             }
             /* accepting or dead: finish the line */
             size_t le = line_end_from(d, x->p, x->end);
-            if (M->ds[t & ~TERM].accept) s_hit(&cx, &ml[k], x->ls, le);
+            if (M->ds[t & ~TERM].accept) s_hit(&cx, &ml[k], line_start_before(d, x->lo, x->p), le);
             x->p = le < x->end ? le + 1 : x->end;
             x->ls = x->p; x->s = init;
         }
@@ -2669,7 +2722,20 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
     } else {
         size_t nlines = count_nl(d + begin, end - begin) + ((end > begin && d[end - 1] != '\n') ? 1 : 0);
         c->count = nlines - matched;
-        if (store_matches) {
+        c->nlines = nlines;
+        /* Chunked plain -v already has the sparse hits. Formatting waits for
+         * the line base and writes non-matching lines directly, instead of
+         * storing one Match per output line and walking it again. */
+        if (plain_prefmt && c->job->chunks) {
+            size_t n = 0, w = 0;
+            for (int k = 0; k < K; k++) n += ml[k].n;
+            size_t *v = n ? xrealloc(NULL, n * sizeof *v) : NULL;
+            for (int k = 0; k < K; k++) if (ml[k].n) {
+                memcpy(v + w, ml[k].v, ml[k].n * sizeof *v);
+                w += ml[k].n;
+            }
+            c->inv = v; c->ninv = n; c->rb = begin; c->re = end; c->vfmt = 1;
+        } else if (store_matches) {
             int k = 0;
             size_t i = 0, pos = begin, ln = 0;
             while (pos < end) {
@@ -2682,8 +2748,7 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
             }
         }
     }
-    if (vflag) c->nlines = count_nl(d + begin, end - begin) + ((end > begin && d[end - 1] != '\n') ? 1 : 0);
-    else if (nflag) c->nlines = cnt + count_nl(d + cnt_pos, end - cnt_pos) + ((end > begin && d[end - 1] != '\n') ? 1 : 0);
+    if (!vflag && nflag) c->nlines = cnt + count_nl(d + cnt_pos, end - cnt_pos) + ((end > begin && d[end - 1] != '\n') ? 1 : 0);
     for (int k = 0; k < 4; k++) free(ml[k].v);
 }
 
@@ -3253,8 +3318,8 @@ static void emit_finish(Emit *E)                    /* trailing context after th
         E->after_left--;
     }
 }
-/* Plain output (no context, -o, colour or -m): format straight into the buffer.
- * This is the printer thread's hot loop when most of a file is printed. */
+/* Plain output (no context, -o, colour or -m). Workers format this themselves
+ * so the printer only writes finished buffers in chunk order. */
 static inline char *put_num(char *w, size_t v)
 {
     char t[24];
@@ -3291,6 +3356,73 @@ static void emit_chunk(Emit *E, const Chunk *c, size_t base)
         o->n = (size_t)(w - o->p);
     }
     E->nsel += c->nm - m;
+}
+/* Same bytes as the fast loop above, into the chunk's own buffer. `base` is the
+ * number of lines in previous chunks, so -n stays absolute across workers. */
+static void format_plain(Chunk *c, size_t base)
+{
+    if (!c->nm) return;
+    const char *name = c->job->name;
+    const size_t nlen = want_name ? strlen(name) : 0;
+    const char *data = c->job->data;
+    size_t bytes = 0;
+    for (size_t k = 0; k < c->nm; k++) bytes += c->m[k].len;
+    size_t cap = bytes + c->nm * (nlen + 48) + 64;
+    char *p = xrealloc(NULL, cap);
+    size_t n = 0;
+    for (size_t k = 0; k < c->nm; k++) {
+        size_t off = c->m[k].off, len = c->m[k].len;
+        size_t need = nlen + 80 + len;
+        if (n + need > cap) { cap = (n + need) * 2 + 256; p = xrealloc(p, cap); }
+        char *w = p + n;
+        if (want_name) { memcpy(w, name, nlen); w += nlen; *w++ = nullflag ? '\0' : ':'; }
+        if (nflag) { w = put_num(w, base + c->m[k].lineno); *w++ = ':'; }
+        if (bflag) { w = put_num(w, off); *w++ = ':'; }
+        memcpy(w, data + off, len); w += len;
+        *w++ = '\n';
+        n = (size_t)(w - p);
+    }
+    c->out = p;
+    c->outlen = n;
+    free(c->m); c->m = NULL; c->nm = c->cap = 0;
+}
+/* -v plain output. `inv` holds the matching lines; everything else is written
+ * once `base` is known. Same bytes as format_plain's walk of a dense Match list. */
+static void format_invert(Chunk *c, size_t base)
+{
+    free(c->m); c->m = NULL; c->nm = c->cap = 0;
+    if (!c->count) { free(c->inv); c->inv = NULL; c->ninv = 0; return; }
+    const char *name = c->job->name;
+    const size_t nlen = want_name ? strlen(name) : 0;
+    const char *data = c->job->data;
+    size_t begin = c->rb, end = c->re, nlines = c->nlines;
+    size_t cap = (end - begin) + nlines * (nlen + 48) + 64;
+    char *p = xrealloc(NULL, cap);
+    size_t n = 0, pos = begin, ln = 0, hi = 0;
+    const size_t *iv = c->inv;
+    size_t np = c->ninv;
+    while (pos < end) {
+        size_t le = line_end_from(data, pos, end);
+        ln++;
+        int skip = hi < np && iv[hi] == pos;
+        if (skip) hi += 2;
+        else {
+            size_t len = le - pos;
+            size_t need = nlen + 80 + len;
+            if (n + need > cap) { cap = (n + need) * 2 + 256; p = xrealloc(p, cap); }
+            char *w = p + n;
+            if (want_name) { memcpy(w, name, nlen); w += nlen; *w++ = nullflag ? '\0' : ':'; }
+            if (nflag) { w = put_num(w, base + ln); *w++ = ':'; }
+            if (bflag) { w = put_num(w, pos); *w++ = ':'; }
+            memcpy(w, data + pos, len); w += len;
+            *w++ = '\n';
+            n = (size_t)(w - p);
+        }
+        pos = le < end ? le + 1 : end;
+    }
+    c->out = p;
+    c->outlen = n;
+    free(c->inv); c->inv = NULL; c->ninv = 0;
 }
 static void report_binary(const char *name)
 {
@@ -3369,6 +3501,7 @@ static void process_small(FileJob *j, Matcher *M, const char *data, size_t size)
         j->outlen = o.n;
     }
     free(c.m);
+    free(c.inv);
 }
 
 static void open_fail(FileJob *j, const char *name, int fd)
@@ -3462,7 +3595,7 @@ static void open_job(FileJob *j, Matcher *M)
 
 static void free_job(FileJob *j)
 {
-    for (size_t k = 0; k < j->nchunks; k++) free(j->chunks[k].m);
+    for (size_t k = 0; k < j->nchunks; k++) { free(j->chunks[k].m); free(j->chunks[k].out); free(j->chunks[k].inv); }
     free(j->chunks);
     free(j->out);
     free(j->ot);
@@ -3490,6 +3623,23 @@ static void *worker(void *arg)
         if (c->is_open) open_job(c->job, &M);
         else {
             run_chunk(c, &M);
+            if (plain_prefmt && !c->job->binary) {
+                pthread_mutex_lock(&mu);
+                while (c->idx > 0 && !c->job->chunks[c->idx - 1].counted)
+                    pthread_cond_wait(&done_cv, &mu);
+                size_t base = 0;
+                if (c->idx > 0) {
+                    Chunk *p = &c->job->chunks[c->idx - 1];
+                    base = p->line_base + p->nlines;
+                }
+                c->line_base = base;
+                c->counted = 1;
+                pthread_cond_broadcast(&done_cv);
+                pthread_mutex_unlock(&mu);
+                if (c->vfmt) format_invert(c, base);
+                else format_plain(c, base);        /* no lock: other chunks format too */
+                c->prefmt = 1;
+            }
             pthread_mutex_lock(&mu);                /* last touch of c: the printer may free it */
             c->done = 1;
             pthread_cond_broadcast(&done_cv);
@@ -3579,12 +3729,19 @@ static void *printer(void *arg)
                             stopped = 1;
                             atomic_store(&j->cancel, 1);
                         }
+                    } else if (c->prefmt) {
+                        if (c->outlen) {
+                            flush_pb(&pb);
+                            if (fwrite(c->out, 1, c->outlen, stdout) != c->outlen) out_error = 1;
+                        }
+                        free(c->out); c->out = NULL;
+                        if (line_buffered) fflush(stdout);
                     } else {
                         emit_chunk(&E, c, base);
                         base += c->nlines;
                         if (E.limit) { stopped = 1; atomic_store(&j->cancel, 1); }
                     }
-                }
+                } else { free(c->out); c->out = NULL; }
                 free(c->m); c->m = NULL; c->nm = 0;
                 if (pb.n > (1 << 16)) { flush_pb(&pb); if (line_buffered) fflush(stdout); }
             }
@@ -4049,6 +4206,9 @@ int main(int argc, char **argv)
     files = (const char **)flist;
     nfiles = nflist;
     store_matches = !(cflag || lflag || Lflag || qflag);
+    /* One worker already overlaps search with the printer. Formatting in that
+     * worker removes the overlap and is slower. Several workers format at once. */
+    plain_prefmt = nthreads > 1 && store_matches && !color_on && !oflag && maxcount < 0 && !ctx_on();
 
     /* \bWORD\b and \<WORD\> over plain word characters mean exactly -w WORD:
      * run them on the same fast path (token lookup) instead of libc regex. */
