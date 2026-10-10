@@ -8,7 +8,7 @@ url='https://github.com/huntsman11177/cg'
 license=('MIT')
 depends=('glibc')
 source=("https://github.com/huntsman11177/cg/releases/download/v${pkgver}/${pkgname}-${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('d5b94b2e485c5ec4d6d2974d998761f42efa2a49c3c0629d023a6280dc69a1d5')
 
 build() {
   cd "${pkgname}-${pkgver}"
