@@ -9,6 +9,6 @@ pkgbase = cg
 	license = MIT
 	depends = glibc
 	source = https://github.com/huntsman11177/cg/releases/download/v1.3.1/cg-1.3.1.tar.gz
-	sha256sums = SKIP
+	sha256sums = d94dfd8d3abcdb39eb890e8ddbf323850a5ecd2779ee65c24f970138785419da
 
 pkgname = cg
