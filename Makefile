@@ -6,7 +6,7 @@ CPPFLAGS ?=
 LDFLAGS ?=
 LDLIBS ?= -pthread
 
-VERSION := $(shell cat VERSION 2>/dev/null || echo 1.2.2)
+VERSION := $(shell cat VERSION 2>/dev/null || echo 1.3.0)
 
 .PHONY: all clean check install install-man uninstall
 

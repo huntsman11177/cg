@@ -6,7 +6,7 @@ The implementation combines parallel file processing with specialized literal sc
 
 ## Status
 
-Current source version: **1.2.2**.
+Current source version: **1.3.0**.
 
 This repository documentation describes the current source tree. It intentionally does not claim full GNU grep compatibility: unsupported features are called out explicitly below.
 

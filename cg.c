@@ -1406,10 +1406,16 @@ static int wcheck(const char *l, size_t n)          /* exact -w verification */
     return 0;
 }
 
+static int wdfa_on;
+static inline int has_high_byte(const char *l, size_t n);
 static int line_matches_base(const char *l, size_t n, Matcher *M);
 static int line_matches(const char *l, size_t n, Matcher *M)
 {
     if (wset_on) return wcheck(l, n);               /* token lookup is exact by itself */
+    if (wdfa_on) {                                  /* bounded DFA is exact for ASCII lines */
+        if (mb_locale && has_high_byte(l, n)) return wcheck(l, n);
+        return dfa_match(M, (const unsigned char *)l, n);
+    }
     int r = line_matches_base(l, n, M);
     if (r && wflag) r = wcheck(l, n);
     return r;
@@ -1485,8 +1491,35 @@ static size_t line_start_at_or_after(const char *d, size_t n, size_t p)
     const char *q = memchr(d + p - 1, '\n', n - (p - 1));
     return q ? (size_t)(q - d) + 1 : n;
 }
+#if defined(__x86_64__)
+__attribute__((target("avx2")))
+static size_t count_nl_avx2(const char *p, size_t n)
+{
+    const __m256i nl = _mm256_set1_epi8('\n');
+    size_t c = 0, i = 0;
+    while (i + 128 <= n) {                           /* 4 vectors per iteration: byte counters, then sum */
+        __m256i a = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + i)), nl);
+        __m256i b = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + i + 32)), nl);
+        __m256i d = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + i + 64)), nl);
+        __m256i e = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + i + 96)), nl);
+        __m256i sum = _mm256_sub_epi8(_mm256_sub_epi8(_mm256_setzero_si256(), a), _mm256_add_epi8(_mm256_add_epi8(b, d), e)); /* -a - (b+d+e) = count */
+        __m256i z = _mm256_sad_epu8(sum, _mm256_setzero_si256());
+        c += (size_t)_mm256_extract_epi64(z, 0) + (size_t)_mm256_extract_epi64(z, 1) +
+             (size_t)_mm256_extract_epi64(z, 2) + (size_t)_mm256_extract_epi64(z, 3);
+        i += 128;
+    }
+    for (; i + 32 <= n; i += 32)
+        c += (size_t)__builtin_popcount((unsigned)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(p + i)), nl)));
+    for (; i < n; i++) c += (p[i] == '\n');
+    return c;
+}
+#endif
 static size_t count_nl(const char *p, size_t n)
 {
+#if defined(__x86_64__)
+    if (n >= 64 && __builtin_cpu_supports("avx2")) return count_nl_avx2(p, n);
+#endif
     size_t c = 0;
     for (size_t i = 0; i < n; i++) c += (p[i] == '\n');
     return c;
@@ -2492,19 +2525,70 @@ static int lit_worth(const char *p, size_t n)
     return n >= 1 && q < 0.004;
 }
 
-/* ---- interleaved streaming DFA for count-only runs ---------------------------
- * -c/-l/-L/-q need only "did this line match".  The DFA's cost is the load-to-load
- * latency of one state transition per byte; lines are independent, so four
- * sub-ranges of the chunk are advanced in lock step and the latencies overlap.
- * Newlines, accepting states and dead states leave the fast loop through TERM. */
+/* ---- interleaved streaming DFA --------------------------------------------
+ * The DFA's cost is the load-to-load latency of one state transition per byte.
+ * Lines are independent, so four sub-ranges of the chunk are advanced in lock
+ * step and the latencies overlap.  Newlines, accepting states and dead states
+ * leave the fast loop through TERM.  Matching lines are recorded per stream
+ * (the sub-ranges are consecutive, so concatenation is already in file order);
+ * -c needs only the count. */
 static int stream_ok;
 typedef struct { size_t p, end, ls; uint16_t s; } Strm;
-static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash);
-static size_t stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
+typedef struct { size_t *v, n, cap; } MList;       /* pairs: line start, line end */
+static inline void ml_add(MList *l, size_t ls, size_t le)
+{
+    if (l->n + 2 > l->cap) { l->cap = l->cap ? l->cap * 2 : 256; l->v = xrealloc(l->v, l->cap * sizeof *l->v); }
+    l->v[l->n++] = ls; l->v[l->n++] = le;
+}
+typedef struct { size_t count; int coll; } SCtx;
+static inline void s_hit(SCtx *cx, MList *l, size_t ls, size_t le)
+{
+    cx->count++;
+    if (qflag) _exit(0);
+    if (cx->coll) ml_add(l, ls, le);
+}
+static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash, SCtx *cx, MList *l)
+{
+    const uint16_t init = M->init;
+    if (*thrash) {                                  /* per-line fallback from the last line start */
+        size_t pos = x->ls;
+        while (pos < x->end) {
+            size_t le = line_end_from(d, pos, x->end);
+            if (dfa_match(M, (const unsigned char *)d + pos, le - pos)) s_hit(cx, l, pos, le);
+            pos = le < x->end ? le + 1 : x->end;
+        }
+        return 0;
+    }
+    uint16_t s = x->s;
+    size_t p = x->p, ls = x->ls;
+    int inline_ = p > ls;                           /* current line has consumed bytes */
+    while (p < x->end) {
+        unsigned char b = (unsigned char)d[p++];
+        uint16_t t = M->sflat[((size_t)s << 8) | b];
+        if (!(t & TERM)) { s = t; inline_ = 1; continue; }
+        if (t == NLV) {
+            if (M->ds[s].endacc) s_hit(cx, l, ls, p - 1);
+            s = init; inline_ = 0; ls = p; continue;
+        }
+        if (t == UNK) {
+            t = compute(M, s, b);
+            if (!(t & TERM)) { s = t; inline_ = 1; continue; }
+        }
+        size_t le = line_end_from(d, p, x->end);
+        if (M->ds[t & ~TERM].accept) s_hit(cx, l, ls, le);
+        p = le < x->end ? le + 1 : x->end;
+        s = init; inline_ = 0; ls = p;
+    }
+    /* last line without a trailing newline */
+    if (inline_ && x->end > 0 && d[x->end - 1] != '\n' && M->ds[s].endacc) s_hit(cx, l, ls, x->end);
+    return 0;
+}
+static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
 {
     const char *d = c->job->data;
     const uint16_t init = M->init;
-    size_t count = 0;
+    SCtx cx = {0, store_matches};
+    MList ml[4] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
     Strm st[4];
     int K = 4;
     if (end - begin < (size_t)(1 << 16)) K = 1;
@@ -2517,7 +2601,7 @@ static size_t stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
     }
     for (int k = 0; k < K; k++) { st[k].p = st[k].ls = cut[k]; st[k].end = cut[k + 1]; st[k].s = init; }
     const uint16_t *sf = M->sflat;
-    uint32_t resets = 0, ep0 = M->epoch;
+    uint32_t resets = 0;
     int thrash = 0;
     while (K == 4 && !thrash) {
         size_t n = (size_t)-1;
@@ -2536,7 +2620,6 @@ static size_t stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
         }
         st[0].p += i; st[1].p += i; st[2].p += i; st[3].p += i;
         if (!((t0 | t1 | t2 | t3) & TERM)) { st[0].s = (uint16_t)s0; st[1].s = (uint16_t)s1; st[2].s = (uint16_t)s2; st[3].s = (uint16_t)s3; continue; }
-        /* event: states before this step are s0..s3, transitions t0..t3 */
         uint32_t ss[4] = {s0, s1, s2, s3}, tt[4] = {t0, t1, t2, t3};
         int voided[4] = {0, 0, 0, 0};
         for (int k = 0; k < 4; k++) {
@@ -2546,7 +2629,7 @@ static size_t stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
             x->s = (uint16_t)ss[k];
             if (!(t & TERM)) { x->s = (uint16_t)t; continue; }
             if (t == NLV) {
-                if (M->ds[x->s].endacc) { count++; if (qflag) _exit(0); }
+                if (M->ds[x->s].endacc) s_hit(&cx, &ml[k], x->ls, x->p - 1);
                 x->s = init; x->ls = x->p; continue;
             }
             if (t == UNK) {
@@ -2563,54 +2646,47 @@ static size_t stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
                 if (!(t & TERM)) { x->s = (uint16_t)t; continue; }
             }
             /* accepting or dead: finish the line */
-            if (M->ds[t & ~TERM].accept) { count++; if (qflag) _exit(0); }
             size_t le = line_end_from(d, x->p, x->end);
+            if (M->ds[t & ~TERM].accept) s_hit(&cx, &ml[k], x->ls, le);
             x->p = le < x->end ? le + 1 : x->end;
             x->ls = x->p; x->s = init;
         }
     }
-    (void)ep0;
-    for (int k = 0; k < K; k++) count += stream_scalar(d, M, &st[k], &thrash);
-    return count;
-}
-/* one stream, one byte at a time; also the fallback when the cache thrashes */
-static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash)
-{
-    size_t count = 0;
-    const uint16_t init = M->init;
-    if (*thrash) {                                  /* per-line fallback from the last line start */
-        size_t pos = x->ls;
-        while (pos < x->end) {
-            size_t le = line_end_from(d, pos, x->end);
-            if (dfa_match(M, (const unsigned char *)d + pos, le - pos)) { count++; if (qflag) _exit(0); }
-            pos = le < x->end ? le + 1 : x->end;
+    for (int k = 0; k < K; k++) stream_scalar(d, M, &st[k], &thrash, &cx, &ml[k]);
+
+    /* ---- results in file order ---- */
+    size_t matched = cx.count, cnt = 0, cnt_pos = begin;
+    if (!vflag) {
+        c->count = matched;
+        if (store_matches) {
+            for (int k = 0; k < K; k++)
+                for (size_t i = 0; i < ml[k].n; i += 2) {
+                    size_t ls = ml[k].v[i], le = ml[k].v[i + 1], ln = 0;
+                    if (nflag) { cnt += count_nl(d + cnt_pos, ls - cnt_pos); cnt_pos = ls; ln = cnt + 1; }
+                    push_match(c, ls, le - ls, ln);
+                }
         }
-        return count;
+    } else {
+        size_t nlines = count_nl(d + begin, end - begin) + ((end > begin && d[end - 1] != '\n') ? 1 : 0);
+        c->count = nlines - matched;
+        if (store_matches) {
+            int k = 0;
+            size_t i = 0, pos = begin, ln = 0;
+            while (pos < end) {
+                size_t le = line_end_from(d, pos, end);
+                ln++;
+                while (k < K && i >= ml[k].n) { k++; i = 0; }
+                if (k < K && ml[k].v[i] == pos) { i += 2; }
+                else push_match(c, pos, le - pos, ln);
+                pos = le < end ? le + 1 : end;
+            }
+        }
     }
-    uint16_t s = x->s;
-    size_t p = x->p;
-    int inline_ = p > x->ls;                         /* current line has consumed bytes */
-    while (p < x->end) {
-        unsigned char b = (unsigned char)d[p++];
-        uint16_t t = M->sflat[((size_t)s << 8) | b];
-        if (!(t & TERM)) { s = t; inline_ = 1; continue; }
-        if (t == NLV) {
-            if (M->ds[s].endacc) { count++; if (qflag) _exit(0); }
-            s = init; inline_ = 0; continue;
-        }
-        if (t == UNK) {
-            t = compute(M, s, b);
-            if (!(t & TERM)) { s = t; inline_ = 1; continue; }
-        }
-        if (M->ds[t & ~TERM].accept) { count++; if (qflag) _exit(0); }
-        size_t le = line_end_from(d, p, x->end);
-        p = le < x->end ? le + 1 : x->end;
-        s = init; inline_ = 0;
-    }
-    /* last line without a trailing newline */
-    if (inline_ && x->end > 0 && d[x->end - 1] != '\n' && M->ds[s].endacc) count++;
-    return count;
+    if (vflag) c->nlines = count_nl(d + begin, end - begin) + ((end > begin && d[end - 1] != '\n') ? 1 : 0);
+    else if (nflag) c->nlines = cnt + count_nl(d + cnt_pos, end - cnt_pos) + ((end > begin && d[end - 1] != '\n') ? 1 : 0);
+    for (int k = 0; k < 4; k++) free(ml[k].v);
 }
+
 static void run_chunk(Chunk *c, Matcher *M)
 {
     FileJob *j = c->job;
@@ -2623,7 +2699,7 @@ static void run_chunk(Chunk *c, Matcher *M)
     if (nmlit > 1) { scan_multi_literal(c, M, begin, end); return; }
     if (lit) { scan_literal(c, M, begin, end); return; }
     if (fb_on) { scan_firstbyte(c, M, begin, end); return; }
-    if (stream_ok && !M->ds[M->init].accept && !M->ds[M->init].dead) { c->count = stream_range(c, M, begin, end); return; }
+    if (stream_ok && !M->ds[M->init].accept && !M->ds[M->init].dead) { stream_range(c, M, begin, end); return; }
 
     size_t pos = begin, ln = 0, count = 0;
     while (pos < end) {
@@ -2925,6 +3001,66 @@ static int try_build_dfa(void)
     return nnfa <= nfa_limit;
 }
 
+
+/* ---- -w as a DFA --------------------------------------------------------------
+ * -w P  ==  (^|\W) P (\W|$)  with P bounded on both sides, exactly what the libc
+ * span regex checks.  Instead of running the DFA for "contains P" and then libc
+ * regex on every candidate line, compile the bounded form into four floating /
+ * anchored branches so the DFA decides alone.  Patterns that can match the empty
+ * string keep the old path (GNU has special rules there). */
+static int nullable_node(const Node *n)
+{
+    switch (n->type) {
+    case N_EMPTY: return 1;
+    case N_LIT: case N_SET: return 0;
+    case N_CAT: for (int k = 0; k < n->nkid; k++) if (!nullable_node(n->kid[k])) return 0; return 1;
+    case N_ALT: for (int k = 0; k < n->nkid; k++) if (nullable_node(n->kid[k])) return 1; return 0;
+    case N_PLUS: return nullable_node(n->kid[0]);
+    default: return 1;                                  /* STAR, QUES */
+    }
+}
+static Node *nonword_node(void)
+{
+    Node *x = nnew(N_SET);
+    for (int ch = 0; ch < 256; ch++) {
+        if (ch >= 0x80 && mb_locale) continue;          /* lines with such bytes go to libc */
+        if (!(isalnum(ch) && ch < 128) && ch != '_') setbit(x->set, ch);
+    }
+    return x;
+}
+static void wrap_w_dfa(void)
+{
+    if (!wflag || xflag || wset_on || engine != ENG_DFA || nbr == 0) return;
+    for (int i = 0; i < nbr; i++) if (nullable_node(br[i].n)) return;
+    Branch *nb = NULL;
+    int nn = 0;
+    for (int i = 0; i < nbr; i++) {
+        for (int v = 0; v < 4; v++) {
+            int left_nw = v & 1, right_nw = (v >> 1) & 1;       /* 1: consume a non-word byte */
+            if (left_nw && br[i].bol) continue;
+            if (right_nw && br[i].eol) continue;
+            Node *cat = nnew(N_CAT);
+            if (left_nw) kid_add(cat, nonword_node());
+            kid_add(cat, br[i].n);
+            if (right_nw) kid_add(cat, nonword_node());
+            nb = xrealloc(nb, (size_t)(nn + 1) * sizeof *nb);
+            nb[nn++] = (Branch){cat, left_nw ? 0 : 1, right_nw ? 0 : 1};
+        }
+    }
+    if (!nn) return;
+    br = nb; nbr = nn;
+    nnfa = 0; n_all = n_float = 0;
+    int match = nstate(2, -1, -1, NULL), eolm = nstate(3, -1, -1, NULL);
+    starts_all = xrealloc(starts_all, (size_t)nbr * sizeof(int));
+    starts_float = xrealloc(starts_float, (size_t)nbr * sizeof(int));
+    for (int i = 0; i < nbr; i++) {
+        int st = build(br[i].n, br[i].eol ? eolm : match);
+        starts_all[n_all++] = st;
+        if (!br[i].bol) starts_float[n_float++] = st;
+    }
+    wdfa_on = nnfa <= nfa_limit;
+}
+
 /* ================= output formatting ================= */
 
 typedef struct { char *p; size_t n, cap; } Buf;
@@ -3117,10 +3253,44 @@ static void emit_finish(Emit *E)                    /* trailing context after th
         E->after_left--;
     }
 }
+/* Plain output (no context, -o, colour or -m): format straight into the buffer.
+ * This is the printer thread's hot loop when most of a file is printed. */
+static inline char *put_num(char *w, size_t v)
+{
+    char t[24];
+    size_t i = 24;
+    do { t[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+    memcpy(w, t + i, 24 - i);
+    return w + (24 - i);
+}
 static void emit_chunk(Emit *E, const Chunk *c, size_t base)
 {
-    for (size_t m = 0; m < c->nm && !E->limit; m++)
-        emit_selected(E, c->m[m].off, c->m[m].len, nflag ? base + c->m[m].lineno : 0);
+    size_t m = 0;
+    if (ctx_on() || oflag || color_on || maxcount >= 0) {
+        for (; m < c->nm && !E->limit; m++)
+            emit_selected(E, c->m[m].off, c->m[m].len, nflag ? base + c->m[m].lineno : 0);
+        return;
+    }
+    if (c->nm && !E->out_any) {                       /* first line: group separator bookkeeping */
+        emit_selected(E, c->m[0].off, c->m[0].len, nflag ? base + c->m[0].lineno : 0);
+        m = 1;
+    }
+    Buf *o = E->o;
+    const size_t nlen = want_name ? strlen(E->name) : 0;
+    const char *data = E->data;
+    for (size_t k = m; k < c->nm; k++) {
+        size_t off = c->m[k].off, len = c->m[k].len;
+        size_t need = nlen + 80 + len;
+        if (o->n + need > o->cap) { o->cap = (o->n + need) * 2 + 256; o->p = xrealloc(o->p, o->cap); }
+        char *w = o->p + o->n;
+        if (want_name) { memcpy(w, E->name, nlen); w += nlen; *w++ = nullflag ? '\0' : ':'; }
+        if (nflag) { w = put_num(w, base + c->m[k].lineno); *w++ = ':'; }
+        if (bflag) { w = put_num(w, off); *w++ = ':'; }
+        memcpy(w, data + off, len); w += len;
+        *w++ = '\n';
+        o->n = (size_t)(w - o->p);
+    }
+    E->nsel += c->nm - m;
 }
 static void report_binary(const char *name)
 {
@@ -3689,7 +3859,7 @@ static void print_help(void)
 }
 static void print_version(void)
 {
-    printf("%s 1.2.2\nA multi-threaded POSIX/GNU-style grep.\n", prog);
+    printf("%s 1.3.0\nA multi-threaded POSIX/GNU-style grep.\n", prog);
 }
 static long parse_num(const char *s, const char *what)
 {
@@ -4007,6 +4177,7 @@ int main(int argc, char **argv)
     }
 
     if (wflag && engine == ENG_DFA && !iflag && !xflag) wset_build();
+    wrap_w_dfa();
     lset_build();
     if (wset_on) {
         /* The token lookup is exact, so literal hits only need to be rare enough
@@ -4032,7 +4203,7 @@ int main(int argc, char **argv)
         teddy_build();
 #endif
     if (engine == ENG_DFA && !vflag && !lit && nmlit == 0) fb_setup();
-    stream_ok = engine == ENG_DFA && !vflag && !store_matches && !nflag && !wflag && !mb_class_used && !fb_on && !lit && nmlit == 0;
+    stream_ok = engine == ENG_DFA && !(vflag && qflag) && !wflag && !mb_class_used && !fb_on && !lit && nmlit == 0;
     wm_build();
     byte_class_build();
     if (!byte_class && nmlit >= 5 && !teddy_ready && !wm_ready) mh_build();

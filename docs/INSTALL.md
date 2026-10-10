@@ -1,6 +1,6 @@
 # Install cg
 
-`cg` 1.2.2 is MIT-licensed. Source and release tags live at
+`cg` 1.3.0 is MIT-licensed. Source and release tags live at
 <https://github.com/huntsman11177/cg>.
 
 The binary installs as `cg` and the manual page as `man cg`.
@@ -43,7 +43,7 @@ makepkg -si
 ```
 
 The `PKGBUILD` on the default branch carries the SHA-256 of the
-`cg-1.2.2.tar.gz` asset on the GitHub release. Official Arch repositories
+`cg-1.3.0.tar.gz` asset on the GitHub release. Official Arch repositories
 (`core`, `extra`) are a separate submission. This release is the AUR package,
 which pacman installs after `makepkg` or an AUR helper.
 
@@ -57,7 +57,7 @@ git clone https://github.com/huntsman11177/cg.git
 cd cg/packaging/rpm
 spectool -g -R cg.spec
 rpmbuild -ba cg.spec
-sudo dnf install ~/rpmbuild/RPMS/*/cg-1.2.2-1.*.rpm
+sudo dnf install ~/rpmbuild/RPMS/*/cg-1.3.0-1.*.rpm
 ```
 
 `dnf install` of that local RPM is the supported path for this release.
@@ -70,7 +70,7 @@ review. That review is not part of this tag.
 git clone https://github.com/huntsman11177/cg.git
 ```
 
-Tagged release: <https://github.com/huntsman11177/cg/releases/tag/v1.2.2>
+Tagged release: <https://github.com/huntsman11177/cg/releases/tag/v1.3.0>
 
 Continuous integration builds `cg` and runs `make check` on every push and
 pull request (`.github/workflows/ci.yml`).

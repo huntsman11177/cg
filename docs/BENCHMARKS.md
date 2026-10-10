@@ -130,3 +130,25 @@ Prefer tables such as:
 | GNU grep | X.Y | — | ... | ... | ... | ... |
 
 Never omit the result count. Equal output is part of the benchmark.
+
+## 1.3.0 snapshot (2026-10-10)
+
+Machine: AMD Ryzen 7 7730U, 16 threads, 22 GiB RAM. Corpus: `en.txt`, 9.3 GB. Output discarded with `>/dev/null`, so these times include formatting the matches. ripgrep 15.2.0 uses its default thread count. `cg` 1.3.0 was timed with `-j1` and `-j8`.
+
+`cg` defaults to basic regular expressions, like GNU grep. `+` is literal unless `-E` is set. ripgrep treats `+` as a quantifier. The two `-w` commands below exited 1 from `cg` because the pattern was a basic expression; that is the same result as `grep -w`, and it is not a faster search. With `-E`, both patterns match. On a 2 MiB prefix, `-E -w -c '[a-z]+ing'` returned 8355 from both `cg` 1.3.0 and ripgrep. `-E -w -c 'th[a-z]+'` returned 17239 from `cg` and 17238 from ripgrep; the extra `cg` line is `Le théâtre brule!`, which GNU grep also selects in this UTF-8 locale.
+
+| Command | cg 1.3.0 -j1 | cg 1.3.0 -j8 | ripgrep default |
+|---|---:|---:|---:|
+| `-w '[a-z]+ing'` | 0.94 s, exit 1 | 0.51 s, exit 1 | 7.67 s |
+| `-E -w '[a-z]+ing'` | 8.22 s |  | 7.67 s |
+| `-w 'th[a-z]+'` | 17.02 s, exit 1 | 3.28 s, exit 1 | 12.55 s |
+| `-E -w 'th[a-z]+'` | 14.14 s |  | 12.55 s |
+| `-n 'e.e.e'` | 11.63 s | 2.67 s | 11.71 s |
+| `-n zzyzx` | 1.21 s | 0.85 s | 0.91 s |
+| `-o 'e.e.e'` | 11.73 s | 2.64 s | 11.75 s |
+| `-v -n 'e.e.e'` | 14.92 s | 8.52 s | 41.42 s |
+| `-n 'a.*z'` | 12.01 s | 2.66 s | 12.30 s |
+
+The `-j8` column is the one that shows the 1.3.0 output path pulling ahead of ripgrep on `e.e.e`, `-o`, and `a.*z`. The invert run is faster even at one thread (14.92 s versus 41.42 s).
+
+The fixed-string count used for 1.2.2 was remeasured warm, same corpus, 189,916 patterns, `-F -j1 -c`. Both 1.2.2 and 1.3.0 returned `336142718` in 3.83–3.84 s. That path did not change. The 7.14 s figure above is an earlier run, not this remeasure.
