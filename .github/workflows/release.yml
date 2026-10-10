@@ -22,7 +22,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           git archive --format=tar.gz --prefix="cg-${version}/" -o "dist/cg-${version}.tar.gz" "${GITHUB_REF_NAME}"
-          sha256sum "dist/cg-${version}.tar.gz" > "dist/cg-${version}.tar.gz.sha256"
+          ( cd dist && sha256sum "cg-${version}.tar.gz" > "cg-${version}.tar.gz.sha256" )
       - name: Release notes
         run: cp "RELEASE_NOTES_${GITHUB_REF_NAME#v}.md" dist/notes.md
       - name: Create GitHub release
