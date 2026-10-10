@@ -1,0 +1,6 @@
+cg
+*.o
+*.pkg.tar.*
+*.rpm
+src/
+pkg/

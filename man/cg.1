@@ -1,0 +1,231 @@
+.TH CG 1 "October 2026" "cg 1.2.2" "User Commands"
+.SH NAME
+cg \- fast multi-threaded POSIX/GNU-style grep implementation
+.SH SYNOPSIS
+.B cg
+.RB [ OPTION ]...
+.I PATTERNS
+.RB [ FILE ]...
+.SH DESCRIPTION
+.B cg
+searches each input file for selected lines matching one or more patterns.
+If no file is given, standard input is read. A file name of
+.B -
+also means standard input.
+.PP
+The implementation uses specialized fixed-string scanners, a Thompson-NFA /
+lazy-DFA engine for its supported regular-expression subset, and the system
+regular-expression implementation as a fallback for patterns requiring features
+outside the internal engine. Large files can be processed by multiple workers.
+.SH PATTERN SELECTION AND INTERPRETATION
+.TP
+.BR -E , " --extended-regexp"
+Interpret patterns as extended regular expressions.
+.TP
+.BR -F , " --fixed-strings"
+Interpret patterns as fixed strings. This is the primary high-throughput path.
+.TP
+.BR -G , " --basic-regexp"
+Interpret patterns as basic regular expressions. This is the default.
+.TP
+.BI "-e " PATTERNS , " --regexp=" PATTERNS
+Use PATTERNS for matching. May be specified more than once.
+.TP
+.BI "-f " FILE , " --file=" FILE
+Read patterns from FILE, one pattern per line. A FILE of
+.B -
+reads patterns from standard input.
+.TP
+.BR -i , " --ignore-case"
+Ignore case distinctions. The
+.B -y
+option is also accepted as a synonym.
+.TP
+.BR --no-ignore-case
+Do not ignore case distinctions.
+.TP
+.BR -w , " --word-regexp"
+Select only lines containing matches that form whole words.
+.TP
+.BR -x , " --line-regexp"
+Select only lines that match a complete pattern.
+.SH OUTPUT CONTROL
+.TP
+.BR -c , " --count"
+Print only the count of selected lines for each file.
+.TP
+.BR -n , " --line-number"
+Prefix output lines with their line number.
+.TP
+.BR -b , " --byte-offset"
+Prefix output with the byte offset.
+.TP
+.BR -H , " --with-filename"
+Always print the file name with selected output.
+.TP
+.BR -h , " --no-filename"
+Suppress the file name prefix.
+.TP
+.BR -l , " --files-with-matches"
+Print only names of files containing a selected line.
+.TP
+.BR -L , " --files-without-match"
+Print only names of files containing no selected lines.
+.TP
+.BR -o , " --only-matching"
+Show only the nonempty parts of lines that match.
+.TP
+.BR -q , " --quiet , --silent"
+Suppress normal output. Exit status still indicates whether a match occurred.
+.TP
+.BR -s , " --no-messages"
+Suppress error messages.
+.TP
+.BI "-m " NUM , " --max-count=" NUM
+Stop after NUM selected lines per file.
+.TP
+.BR -Z , " --null"
+Print a NUL byte after file names.
+.TP
+.BI "--color[=WHEN]"
+Highlight matches using markers. WHEN may be
+.BR always ,
+.BR never , or
+.BR auto .
+The spelling
+.B --colour
+is also accepted.
+.TP
+.BI "--line-buffered"
+Flush output after every line.
+.TP
+.BI "--label=" LABEL
+Use LABEL as the name for standard input in output.
+.SH CONTEXT
+.TP
+.BI "-A " NUM , " --after-context=" NUM
+Print NUM lines of trailing context.
+.TP
+.BI "-B " NUM , " --before-context=" NUM
+Print NUM lines of leading context.
+.TP
+.BI "-C " NUM , " --context=" NUM
+Print NUM lines of context before and after selected lines.
+.TP
+.BI - NUM
+A decimal option such as
+.B -3
+is accepted as shorthand for
+.B --context=3.
+.SH FILE TRAVERSAL
+.TP
+.BR -r , " --recursive"
+Recursively search directories without following symbolic links.
+.TP
+.BR -R , " --dereference-recursive"
+Recursively search while following symbolic links.
+.TP
+.BI "-d " ACTION , " --directories=" ACTION
+Handle directories using
+.BR read ,
+.BR recurse , or
+.BR skip .
+.TP
+.BI "-D " ACTION , " --devices=" ACTION
+Accept
+.BR read
+or
+.BR skip
+for compatibility.
+.TP
+.BI "--include=" GLOB
+Search only files whose names match GLOB.
+.TP
+.BI "--exclude=" GLOB
+Skip files whose names match GLOB.
+.TP
+.BI "--exclude-dir=" GLOB
+Skip directories whose names match GLOB.
+.SH BINARY INPUT
+.TP
+.BR -a , " --text"
+Treat binary input as text.
+.TP
+.BR -I
+Treat binary files as without-match.
+.TP
+.BI "--binary-files=" TYPE
+TYPE is one of
+.BR binary ,
+.BR text , or
+.BR without-match .
+.SH PERFORMANCE AND THREADING
+.TP
+.BI "-j " N , " --threads=" N
+Use N worker threads. N must be between 1 and 256. The default on Linux is
+the detected physical-core count.
+.PP
+Large files are memory-mapped and divided into work chunks. The environment
+variable
+.B CG_CHUNK_KIB
+can tune the work-unit size from 64 KiB through 1 GiB. The default is about
+4 MiB.
+.PP
+On x86-64, several literal-search paths use AVX2 when the relevant implementation
+path is selected. Performance is workload- and CPU-dependent.
+.SH REGULAR EXPRESSIONS
+The internal regex engine supports a defined BRE/ERE subset. Patterns requiring
+features outside that engine can be passed to the system regex implementation.
+The source also recognizes pure literal alternatives before building the NFA so
+large literal alternations can remain on the specialized literal path.
+.SH EXIT STATUS
+.TP
+.B 0
+At least one selected line was found. With
+.B -q,
+this is returned as soon as a match is established.
+.TP
+.B 1
+No selected lines were found.
+.TP
+.B 2
+An error occurred, including an explicitly unsupported option.
+.SH UNSUPPORTED OPTIONS
+The following options are explicitly rejected by the current implementation:
+.TP
+.B -P, --perl-regexp
+Perl-compatible regular expressions are not supported.
+.TP
+.B -z, --null-data
+NUL-separated input records are not supported.
+.SH ENVIRONMENT
+.TP
+.B CG_CHUNK_KIB
+Controls the large-file worker chunk size. Values outside 64 KiB through 1 GiB
+are ignored.
+.SH EXAMPLES
+.TP
+.B cg -F needle file.txt
+Search for a fixed string.
+.TP
+.B cg -F -f patterns.txt large.txt
+Search for many fixed strings read from a pattern file.
+.TP
+.B cg -E 'foo|bar' file.txt
+Search using an extended regular expression.
+.TP
+.B cg -j 8 -F -f patterns.txt large.txt
+Use eight worker threads.
+.TP
+.B cg -r -F needle src/
+Recursively search a directory.
+.SH SEE ALSO
+.BR grep (1)
+.SH NOTES
+The command-line interface is intentionally grep-like but is not a claim of full
+GNU grep compatibility. Consult the project's compatibility documentation and
+run
+.B cg --help
+for the authoritative option list for the installed build.
+.SH AUTHOR
+Project author and maintainer: see the project repository.
