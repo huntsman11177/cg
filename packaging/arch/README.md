@@ -1,6 +1,6 @@
 # Arch package
 
-`PKGBUILD` builds `cg` from the GitHub tag archive and installs it with
+`PKGBUILD` builds `cg` from the GitHub release archive and installs it with
 `PREFIX=/usr` so pacman can track the files.
 
 ```sh
