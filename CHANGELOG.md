@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1
+
+- Plain output with more than one worker is formatted in the worker that searched the chunk. The printer writes the finished buffers in order. One worker still formats in the printer, so search and output overlap.
+- A newline in the streaming DFA restarts a non-end-anchor state inside the four-way loop. End-anchor newlines, accepts, and dead states still leave that loop.
+- Plain `-v` with more than one worker keeps the sparse list of matching lines and writes the other lines directly. It does not store one record per output line.
+
+Fixed-string search is unchanged. Timings are in `docs/BENCHMARKS.md`.
+
 ## 1.3.0
 
 Source drop previously built as `cg1`.

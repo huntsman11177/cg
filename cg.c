@@ -4016,7 +4016,7 @@ static void print_help(void)
 }
 static void print_version(void)
 {
-    printf("%s 1.3.0\nA multi-threaded POSIX/GNU-style grep.\n", prog);
+    printf("%s 1.3.1\nA multi-threaded POSIX/GNU-style grep.\n", prog);
 }
 static long parse_num(const char *s, const char *what)
 {

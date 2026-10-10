@@ -1,6 +1,6 @@
 pkgbase = cg
 	pkgdesc = Fast multi-threaded POSIX/GNU-style grep
-	pkgver = 1.3.0
+	pkgver = 1.3.1
 	pkgrel = 1
 	url = https://github.com/huntsman11177/cg
 	arch = x86_64
@@ -8,7 +8,7 @@ pkgbase = cg
 	arch = riscv64
 	license = MIT
 	depends = glibc
-	source = https://github.com/huntsman11177/cg/releases/download/v1.3.0/cg-1.3.0.tar.gz
-	sha256sums = d5b94b2e485c5ec4d6d2974d998761f42efa2a49c3c0629d023a6280dc69a1d5
+	source = https://github.com/huntsman11177/cg/releases/download/v1.3.1/cg-1.3.1.tar.gz
+	sha256sums = SKIP
 
 pkgname = cg

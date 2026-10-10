@@ -10,11 +10,11 @@ makepkg -si
 The SHA-256 in `PKGBUILD` is the checksum of
 
 ```text
-https://github.com/huntsman11177/cg/releases/download/v1.3.0/cg-1.3.0.tar.gz
+https://github.com/huntsman11177/cg/releases/download/v1.3.1/cg-1.3.1.tar.gz
 ```
 
 That digest is filled in on the default branch after the tag exists. The copy
-of this file inside the `v1.3.0` archive may still say `SKIP`. Use the
+of this file inside the `v1.3.1` archive may still say `SKIP`. Use the
 `PKGBUILD` from the default branch, or from the AUR repository, to build.
 
 ## AUR
@@ -28,7 +28,7 @@ git clone ssh://aur@aur.archlinux.org/cg.git aur-cg
 cp PKGBUILD .SRCINFO aur-cg/
 cd aur-cg
 git add PKGBUILD .SRCINFO
-git commit -m "Update to cg 1.3.0"
+git commit -m "Update to cg 1.3.1"
 git push origin master
 ```
 

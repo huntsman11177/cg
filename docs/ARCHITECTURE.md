@@ -46,7 +46,7 @@ Larger files are memory-mapped and divided into work chunks. The default chunk s
 
 Chunks own lines that start inside their byte range. Workers therefore do not need a global pre-scan merely to establish chunk boundaries.
 
-A printer stage preserves argument/file order while allowing workers to execute out of order.
+A printer stage preserves argument/file order while allowing workers to execute out of order. With more than one worker, plain output (no color, context, `-o`, or `-m`) is formatted in the worker after the previous chunk's line count is known. The printer writes those buffers in order. A single worker still formats in the printer so that search and output overlap. Plain `-v` on that multi-worker path keeps only the matching lines and writes every other line from the file bytes.
 
 ## Matching engines
 
