@@ -145,6 +145,7 @@ typedef struct { char *p; size_t n, r; } MLit;
 static MLit *mlits;
 static size_t nmlit;
 static int mlit_exact; /* every branch is this literal: AC hit == match */
+static int mlit_icase;             /* mlits[] are ASCII-lowercased; scan a folded window */
 /* Every literal is one byte. find_mlit is one class scan, not N memchrs. */
 static int byte_class, byte_avx, byte_n;
 static unsigned char byte_set[256], byte_list[16];
@@ -465,9 +466,202 @@ static Node *make_escape_class(Parser *P, unsigned char d)
     (void)P;
     return n;
 }
+/* Simple Unicode case pairs (Latin, Greek, Cyrillic).  A code point absent
+ * from this table — ß, İ, ſ, final sigma — keeps the pattern on libc. */
+static const uint16_t fold_a[] = {
+   0x00C0,0x00C1,0x00C2,0x00C3,0x00C4,0x00C5,0x00C6,0x00C7,0x00C8,0x00C9,0x00CA,0x00CB,0x00CC,0x00CD,
+   0x00CE,0x00CF,0x00D0,0x00D1,0x00D2,0x00D3,0x00D4,0x00D5,0x00D6,0x00D8,0x00D9,0x00DA,0x00DB,0x00DC,
+   0x00DD,0x00DE,0x00E0,0x00E1,0x00E2,0x00E3,0x00E4,0x00E5,0x00E6,0x00E7,0x00E8,0x00E9,0x00EA,0x00EB,
+   0x00EC,0x00ED,0x00EE,0x00EF,0x00F0,0x00F1,0x00F2,0x00F3,0x00F4,0x00F5,0x00F6,0x00F8,0x00F9,0x00FA,
+   0x00FB,0x00FC,0x00FD,0x00FE,0x00FF,0x0100,0x0101,0x0102,0x0103,0x0104,0x0105,0x0106,0x0107,0x0108,
+   0x0109,0x010A,0x010B,0x010C,0x010D,0x010E,0x010F,0x0110,0x0111,0x0112,0x0113,0x0114,0x0115,0x0116,
+   0x0117,0x0118,0x0119,0x011A,0x011B,0x011C,0x011D,0x011E,0x011F,0x0120,0x0121,0x0122,0x0123,0x0124,
+   0x0125,0x0126,0x0127,0x0128,0x0129,0x012A,0x012B,0x012C,0x012D,0x012E,0x012F,0x0132,0x0133,0x0134,
+   0x0135,0x0136,0x0137,0x0138,0x0139,0x013A,0x013B,0x013C,0x013D,0x013E,0x013F,0x0140,0x0141,0x0142,
+   0x0143,0x0144,0x0145,0x0146,0x0147,0x0148,0x014A,0x014B,0x014C,0x014D,0x014E,0x014F,0x0150,0x0151,
+   0x0152,0x0153,0x0154,0x0155,0x0156,0x0157,0x0158,0x0159,0x015A,0x015B,0x015C,0x015D,0x015E,0x015F,
+   0x0160,0x0161,0x0162,0x0163,0x0164,0x0165,0x0166,0x0167,0x0168,0x0169,0x016A,0x016B,0x016C,0x016D,
+   0x016E,0x016F,0x0170,0x0171,0x0172,0x0173,0x0174,0x0175,0x0176,0x0177,0x0178,0x0179,0x017A,0x017B,
+   0x017C,0x017D,0x017E,0x0180,0x0181,0x0182,0x0183,0x0184,0x0185,0x0186,0x0187,0x0188,0x0189,0x018A,
+   0x018B,0x018C,0x018D,0x018E,0x018F,0x0190,0x0191,0x0192,0x0193,0x0194,0x0195,0x0196,0x0197,0x0198,
+   0x0199,0x019A,0x019B,0x019C,0x019D,0x019E,0x019F,0x01A0,0x01A1,0x01A2,0x01A3,0x01A4,0x01A5,0x01A6,
+   0x01A7,0x01A8,0x01A9,0x01AA,0x01AB,0x01AC,0x01AD,0x01AE,0x01AF,0x01B0,0x01B1,0x01B2,0x01B3,0x01B4,
+   0x01B5,0x01B6,0x01B7,0x01B8,0x01B9,0x01BA,0x01BB,0x01BC,0x01BD,0x01BE,0x01BF,0x01C0,0x01C1,0x01C2,
+   0x01C3,0x01CD,0x01CE,0x01CF,0x01D0,0x01D1,0x01D2,0x01D3,0x01D4,0x01D5,0x01D6,0x01D7,0x01D8,0x01D9,
+   0x01DA,0x01DB,0x01DC,0x01DD,0x01DE,0x01DF,0x01E0,0x01E1,0x01E2,0x01E3,0x01E4,0x01E5,0x01E6,0x01E7,
+   0x01E8,0x01E9,0x01EA,0x01EB,0x01EC,0x01ED,0x01EE,0x01EF,0x01F4,0x01F5,0x01F6,0x01F7,0x01F8,0x01F9,
+   0x01FA,0x01FB,0x01FC,0x01FD,0x01FE,0x01FF,0x0200,0x0201,0x0202,0x0203,0x0204,0x0205,0x0206,0x0207,
+   0x0208,0x0209,0x020A,0x020B,0x020C,0x020D,0x020E,0x020F,0x0210,0x0211,0x0212,0x0213,0x0214,0x0215,
+   0x0216,0x0217,0x0218,0x0219,0x021A,0x021B,0x021C,0x021D,0x021E,0x021F,0x0220,0x0221,0x0222,0x0223,
+   0x0224,0x0225,0x0226,0x0227,0x0228,0x0229,0x022A,0x022B,0x022C,0x022D,0x022E,0x022F,0x0230,0x0231,
+   0x0232,0x0233,0x0234,0x0235,0x0236,0x0237,0x0238,0x0239,0x023A,0x023B,0x023C,0x023D,0x023E,0x023F,
+   0x0240,0x0241,0x0242,0x0243,0x0244,0x0245,0x0246,0x0247,0x0248,0x0249,0x024A,0x024B,0x024C,0x024D,
+   0x024E,0x024F,0x0370,0x0371,0x0372,0x0373,0x0374,0x0376,0x0377,0x037A,0x037B,0x037C,0x037D,0x037F,
+   0x0386,0x0388,0x0389,0x038A,0x038C,0x038E,0x038F,0x0391,0x0393,0x0394,0x0396,0x0397,0x0399,0x039B,
+   0x039C,0x039D,0x039E,0x039F,0x03A4,0x03A5,0x03A7,0x03A8,0x03A9,0x03AA,0x03AB,0x03AC,0x03AD,0x03AE,
+   0x03AF,0x03B1,0x03B3,0x03B4,0x03B6,0x03B7,0x03B9,0x03BB,0x03BC,0x03BD,0x03BE,0x03BF,0x03C4,0x03C5,
+   0x03C7,0x03C8,0x03C9,0x03CA,0x03CB,0x03CC,0x03CD,0x03CE,0x03CF,0x03D2,0x03D3,0x03D4,0x03D7,0x03D8,
+   0x03D9,0x03DA,0x03DB,0x03DC,0x03DD,0x03DE,0x03DF,0x03E0,0x03E1,0x03E2,0x03E3,0x03E4,0x03E5,0x03E6,
+   0x03E7,0x03E8,0x03E9,0x03EA,0x03EB,0x03EC,0x03ED,0x03EE,0x03EF,0x03F2,0x03F3,0x03F7,0x03F8,0x03F9,
+   0x03FA,0x03FB,0x03FC,0x03FD,0x03FE,0x03FF,0x0400,0x0401,0x0402,0x0403,0x0404,0x0405,0x0406,0x0407,
+   0x0408,0x0409,0x040A,0x040B,0x040C,0x040D,0x040E,0x040F,0x0410,0x0411,0x0412,0x0413,0x0414,0x0415,
+   0x0416,0x0417,0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,0x041F,0x0420,0x0421,0x0422,0x0423,
+   0x0424,0x0425,0x0426,0x0427,0x0428,0x0429,0x042A,0x042B,0x042C,0x042D,0x042E,0x042F,0x0430,0x0431,
+   0x0432,0x0433,0x0434,0x0435,0x0436,0x0437,0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x043E,0x043F,
+   0x0440,0x0441,0x0442,0x0443,0x0444,0x0445,0x0446,0x0447,0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,
+   0x044E,0x044F,0x0450,0x0451,0x0452,0x0453,0x0454,0x0455,0x0456,0x0457,0x0458,0x0459,0x045A,0x045B,
+   0x045C,0x045D,0x045E,0x045F,0x0460,0x0461,0x0462,0x0463,0x0464,0x0465,0x0466,0x0467,0x0468,0x0469,
+   0x046A,0x046B,0x046C,0x046D,0x046E,0x046F,0x0470,0x0471,0x0472,0x0473,0x0474,0x0475,0x0476,0x0477,
+   0x0478,0x0479,0x047A,0x047B,0x047C,0x047D,0x047E,0x047F,0x0480,0x0481,0x048A,0x048B,0x048C,0x048D,
+   0x048E,0x048F,0x0490,0x0491,0x0492,0x0493,0x0494,0x0495,0x0496,0x0497,0x0498,0x0499,0x049A,0x049B,
+   0x049C,0x049D,0x049E,0x049F,0x04A0,0x04A1,0x04A2,0x04A3,0x04A4,0x04A5,0x04A6,0x04A7,0x04A8,0x04A9,
+   0x04AA,0x04AB,0x04AC,0x04AD,0x04AE,0x04AF,0x04B0,0x04B1,0x04B2,0x04B3,0x04B4,0x04B5,0x04B6,0x04B7,
+   0x04B8,0x04B9,0x04BA,0x04BB,0x04BC,0x04BD,0x04BE,0x04BF,0x04C0,0x04C1,0x04C2,0x04C3,0x04C4,0x04C5,
+   0x04C6,0x04C7,0x04C8,0x04C9,0x04CA,0x04CB,0x04CC,0x04CD,0x04CE,0x04CF,0x04D0,0x04D1,0x04D2,0x04D3,
+   0x04D4,0x04D5,0x04D6,0x04D7,0x04D8,0x04D9,0x04DA,0x04DB,0x04DC,0x04DD,0x04DE,0x04DF,0x04E0,0x04E1,
+   0x04E2,0x04E3,0x04E4,0x04E5,0x04E6,0x04E7,0x04E8,0x04E9,0x04EA,0x04EB,0x04EC,0x04ED,0x04EE,0x04EF,
+   0x04F0,0x04F1,0x04F2,0x04F3,0x04F4,0x04F5,0x04F6,0x04F7,0x04F8,0x04F9,0x04FA,0x04FB,0x04FC,0x04FD,
+   0x04FE,0x04FF,0x0500,0x0501,0x0502,0x0503,0x0504,0x0505,0x0506,0x0507,0x0508,0x0509,0x050A,0x050B,
+   0x050C,0x050D,0x050E,0x050F,0x0510,0x0511,0x0512,0x0513,0x0514,0x0515,0x0516,0x0517,0x0518,0x0519,
+   0x051A,0x051B,0x051C,0x051D,0x051E,0x051F,0x0520,0x0521,0x0522,0x0523,0x0524,0x0525,0x0526,0x0527,
+   0x0528,0x0529,0x052A,0x052B,0x052C,0x052D,0x052E,0x052F,
+};
+static const uint16_t fold_b[] = {
+   0x00E0,0x00E1,0x00E2,0x00E3,0x00E4,0x00E5,0x00E6,0x00E7,0x00E8,0x00E9,0x00EA,0x00EB,0x00EC,0x00ED,
+   0x00EE,0x00EF,0x00F0,0x00F1,0x00F2,0x00F3,0x00F4,0x00F5,0x00F6,0x00F8,0x00F9,0x00FA,0x00FB,0x00FC,
+   0x00FD,0x00FE,0x00C0,0x00C1,0x00C2,0x00C3,0x00C4,0x00C5,0x00C6,0x00C7,0x00C8,0x00C9,0x00CA,0x00CB,
+   0x00CC,0x00CD,0x00CE,0x00CF,0x00D0,0x00D1,0x00D2,0x00D3,0x00D4,0x00D5,0x00D6,0x00D8,0x00D9,0x00DA,
+   0x00DB,0x00DC,0x00DD,0x00DE,0x0178,0x0101,0x0100,0x0103,0x0102,0x0105,0x0104,0x0107,0x0106,0x0109,
+   0x0108,0x010B,0x010A,0x010D,0x010C,0x010F,0x010E,0x0111,0x0110,0x0113,0x0112,0x0115,0x0114,0x0117,
+   0x0116,0x0119,0x0118,0x011B,0x011A,0x011D,0x011C,0x011F,0x011E,0x0121,0x0120,0x0123,0x0122,0x0125,
+   0x0124,0x0127,0x0126,0x0129,0x0128,0x012B,0x012A,0x012D,0x012C,0x012F,0x012E,0x0133,0x0132,0x0135,
+   0x0134,0x0137,0x0136,0x0138,0x013A,0x0139,0x013C,0x013B,0x013E,0x013D,0x0140,0x013F,0x0142,0x0141,
+   0x0144,0x0143,0x0146,0x0145,0x0148,0x0147,0x014B,0x014A,0x014D,0x014C,0x014F,0x014E,0x0151,0x0150,
+   0x0153,0x0152,0x0155,0x0154,0x0157,0x0156,0x0159,0x0158,0x015B,0x015A,0x015D,0x015C,0x015F,0x015E,
+   0x0161,0x0160,0x0163,0x0162,0x0165,0x0164,0x0167,0x0166,0x0169,0x0168,0x016B,0x016A,0x016D,0x016C,
+   0x016F,0x016E,0x0171,0x0170,0x0173,0x0172,0x0175,0x0174,0x0177,0x0176,0x00FF,0x017A,0x0179,0x017C,
+   0x017B,0x017E,0x017D,0x0243,0x0181,0x0183,0x0182,0x0185,0x0184,0x0186,0x0188,0x0187,0x0189,0x018A,
+   0x018C,0x018B,0x018D,0x01DD,0x018F,0x0190,0x0192,0x0191,0x0193,0x0194,0x01F6,0x0196,0x0197,0x0199,
+   0x0198,0x023D,0x019B,0x019C,0x019D,0x0220,0x019F,0x01A1,0x01A0,0x01A3,0x01A2,0x01A5,0x01A4,0x01A6,
+   0x01A8,0x01A7,0x01A9,0x01AA,0x01AB,0x01AD,0x01AC,0x01AE,0x01B0,0x01AF,0x01B1,0x01B2,0x01B4,0x01B3,
+   0x01B6,0x01B5,0x01B7,0x01B9,0x01B8,0x01BA,0x01BB,0x01BD,0x01BC,0x01BE,0x01F7,0x01C0,0x01C1,0x01C2,
+   0x01C3,0x01CE,0x01CD,0x01D0,0x01CF,0x01D2,0x01D1,0x01D4,0x01D3,0x01D6,0x01D5,0x01D8,0x01D7,0x01DA,
+   0x01D9,0x01DC,0x01DB,0x018E,0x01DF,0x01DE,0x01E1,0x01E0,0x01E3,0x01E2,0x01E5,0x01E4,0x01E7,0x01E6,
+   0x01E9,0x01E8,0x01EB,0x01EA,0x01ED,0x01EC,0x01EF,0x01EE,0x01F5,0x01F4,0x0195,0x01BF,0x01F9,0x01F8,
+   0x01FB,0x01FA,0x01FD,0x01FC,0x01FF,0x01FE,0x0201,0x0200,0x0203,0x0202,0x0205,0x0204,0x0207,0x0206,
+   0x0209,0x0208,0x020B,0x020A,0x020D,0x020C,0x020F,0x020E,0x0211,0x0210,0x0213,0x0212,0x0215,0x0214,
+   0x0217,0x0216,0x0219,0x0218,0x021B,0x021A,0x021D,0x021C,0x021F,0x021E,0x019E,0x0221,0x0223,0x0222,
+   0x0225,0x0224,0x0227,0x0226,0x0229,0x0228,0x022B,0x022A,0x022D,0x022C,0x022F,0x022E,0x0231,0x0230,
+   0x0233,0x0232,0x0234,0x0235,0x0236,0x0237,0x0238,0x0239,0x023A,0x023C,0x023B,0x019A,0x023E,0x023F,
+   0x0240,0x0242,0x0241,0x0180,0x0244,0x0245,0x0247,0x0246,0x0249,0x0248,0x024B,0x024A,0x024D,0x024C,
+   0x024F,0x024E,0x0371,0x0370,0x0373,0x0372,0x0374,0x0377,0x0376,0x037A,0x03FD,0x03FE,0x03FF,0x03F3,
+   0x03AC,0x03AD,0x03AE,0x03AF,0x03CC,0x03CD,0x03CE,0x03B1,0x03B3,0x03B4,0x03B6,0x03B7,0x03B9,0x03BB,
+   0x03BC,0x03BD,0x03BE,0x03BF,0x03C4,0x03C5,0x03C7,0x03C8,0x03C9,0x03CA,0x03CB,0x0386,0x0388,0x0389,
+   0x038A,0x0391,0x0393,0x0394,0x0396,0x0397,0x0399,0x039B,0x039C,0x039D,0x039E,0x039F,0x03A4,0x03A5,
+   0x03A7,0x03A8,0x03A9,0x03AA,0x03AB,0x038C,0x038E,0x038F,0x03D7,0x03D2,0x03D3,0x03D4,0x03CF,0x03D9,
+   0x03D8,0x03DB,0x03DA,0x03DD,0x03DC,0x03DF,0x03DE,0x03E1,0x03E0,0x03E3,0x03E2,0x03E5,0x03E4,0x03E7,
+   0x03E6,0x03E9,0x03E8,0x03EB,0x03EA,0x03ED,0x03EC,0x03EF,0x03EE,0x03F9,0x037F,0x03F8,0x03F7,0x03F2,
+   0x03FB,0x03FA,0x03FC,0x037B,0x037C,0x037D,0x0450,0x0451,0x0452,0x0453,0x0454,0x0455,0x0456,0x0457,
+   0x0458,0x0459,0x045A,0x045B,0x045C,0x045D,0x045E,0x045F,0x0430,0x0431,0x0432,0x0433,0x0434,0x0435,
+   0x0436,0x0437,0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x043E,0x043F,0x0440,0x0441,0x0442,0x0443,
+   0x0444,0x0445,0x0446,0x0447,0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,0x044E,0x044F,0x0410,0x0411,
+   0x0412,0x0413,0x0414,0x0415,0x0416,0x0417,0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,0x041F,
+   0x0420,0x0421,0x0422,0x0423,0x0424,0x0425,0x0426,0x0427,0x0428,0x0429,0x042A,0x042B,0x042C,0x042D,
+   0x042E,0x042F,0x0400,0x0401,0x0402,0x0403,0x0404,0x0405,0x0406,0x0407,0x0408,0x0409,0x040A,0x040B,
+   0x040C,0x040D,0x040E,0x040F,0x0461,0x0460,0x0463,0x0462,0x0465,0x0464,0x0467,0x0466,0x0469,0x0468,
+   0x046B,0x046A,0x046D,0x046C,0x046F,0x046E,0x0471,0x0470,0x0473,0x0472,0x0475,0x0474,0x0477,0x0476,
+   0x0479,0x0478,0x047B,0x047A,0x047D,0x047C,0x047F,0x047E,0x0481,0x0480,0x048B,0x048A,0x048D,0x048C,
+   0x048F,0x048E,0x0491,0x0490,0x0493,0x0492,0x0495,0x0494,0x0497,0x0496,0x0499,0x0498,0x049B,0x049A,
+   0x049D,0x049C,0x049F,0x049E,0x04A1,0x04A0,0x04A3,0x04A2,0x04A5,0x04A4,0x04A7,0x04A6,0x04A9,0x04A8,
+   0x04AB,0x04AA,0x04AD,0x04AC,0x04AF,0x04AE,0x04B1,0x04B0,0x04B3,0x04B2,0x04B5,0x04B4,0x04B7,0x04B6,
+   0x04B9,0x04B8,0x04BB,0x04BA,0x04BD,0x04BC,0x04BF,0x04BE,0x04CF,0x04C2,0x04C1,0x04C4,0x04C3,0x04C6,
+   0x04C5,0x04C8,0x04C7,0x04CA,0x04C9,0x04CC,0x04CB,0x04CE,0x04CD,0x04C0,0x04D1,0x04D0,0x04D3,0x04D2,
+   0x04D5,0x04D4,0x04D7,0x04D6,0x04D9,0x04D8,0x04DB,0x04DA,0x04DD,0x04DC,0x04DF,0x04DE,0x04E1,0x04E0,
+   0x04E3,0x04E2,0x04E5,0x04E4,0x04E7,0x04E6,0x04E9,0x04E8,0x04EB,0x04EA,0x04ED,0x04EC,0x04EF,0x04EE,
+   0x04F1,0x04F0,0x04F3,0x04F2,0x04F5,0x04F4,0x04F7,0x04F6,0x04F9,0x04F8,0x04FB,0x04FA,0x04FD,0x04FC,
+   0x04FF,0x04FE,0x0501,0x0500,0x0503,0x0502,0x0505,0x0504,0x0507,0x0506,0x0509,0x0508,0x050B,0x050A,
+   0x050D,0x050C,0x050F,0x050E,0x0511,0x0510,0x0513,0x0512,0x0515,0x0514,0x0517,0x0516,0x0519,0x0518,
+   0x051B,0x051A,0x051D,0x051C,0x051F,0x051E,0x0521,0x0520,0x0523,0x0522,0x0525,0x0524,0x0527,0x0526,
+   0x0529,0x0528,0x052B,0x052A,0x052D,0x052C,0x052F,0x052E,
+};
+static const size_t fold_n = 778;
+
+static int fold_lookup(uint32_t cp, uint32_t *other)
+{
+    size_t lo = 0, hi = fold_n;
+    if (cp > 0xFFFF) return 0;
+    while (lo < hi) {
+        size_t m = (lo + hi) / 2;
+        if (fold_a[m] < cp) lo = m + 1;
+        else hi = m;
+    }
+    if (lo >= fold_n || fold_a[lo] != cp) return 0;
+    *other = fold_b[lo];
+    return 1;
+}
+static int enc_utf8(uint32_t cp, unsigned char *o)
+{
+    if (cp < 0x80) { o[0] = (unsigned char)cp; return 1; }
+    if (cp < 0x800) {
+        o[0] = (unsigned char)(0xC0 | (cp >> 6));
+        o[1] = (unsigned char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    o[0] = (unsigned char)(0xE0 | (cp >> 12));
+    o[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+    o[2] = (unsigned char)(0x80 | (cp & 0x3F));
+    return 3;
+}
+static int utf8_decode(const char *s, size_t n, size_t i, uint32_t *cp, size_t *len)
+{
+    if (i >= n) return -1;
+    unsigned char c = (unsigned char)s[i];
+    if (c < 0x80) return -1;
+    if ((c & 0xE0) == 0xC0 && i + 1 < n && ((unsigned char)s[i + 1] & 0xC0) == 0x80) {
+        uint32_t u = ((uint32_t)(c & 0x1F) << 6) | ((unsigned char)s[i + 1] & 0x3F);
+        if (u < 0x80) return -1;
+        *cp = u; *len = 2; return 1;
+    }
+    if ((c & 0xF0) == 0xE0 && i + 2 < n &&
+        ((unsigned char)s[i + 1] & 0xC0) == 0x80 && ((unsigned char)s[i + 2] & 0xC0) == 0x80) {
+        uint32_t u = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)((unsigned char)s[i + 1] & 0x3F) << 6) |
+                     ((unsigned char)s[i + 2] & 0x3F);
+        if (u < 0x800) return -1;
+        *cp = u; *len = 3; return 1;
+    }
+    return -1;
+}
+static Node *bytes_node(const unsigned char *b, int n)
+{
+    if (n == 1) { Node *l = nnew(N_LIT); l->c = b[0]; return l; }
+    Node *c = nnew(N_CAT);
+    for (int i = 0; i < n; i++) { Node *l = nnew(N_LIT); l->c = b[i]; kid_add(c, l); }
+    return c;
+}
+static Node *fold_node(uint32_t cp)
+{
+    uint32_t oth;
+    if (!fold_lookup(cp, &oth)) return NULL;
+    unsigned char a[4], b[4];
+    int na = enc_utf8(cp, a);
+    if (oth == cp) return bytes_node(a, na);
+    int nb = enc_utf8(oth, b);
+    Node *alt = nnew(N_ALT);
+    kid_add(alt, bytes_node(a, na));
+    kid_add(alt, bytes_node(b, nb));
+    return alt;
+}
 static Node *parse_atom(Parser *P, int depth, int first)
 {
     unsigned char c = (unsigned char)P->p[P->i];
+    if (c >= 0x80) {
+        uint32_t cp; size_t len = 0;
+        if (utf8_decode(P->p, P->n, P->i, &cp, &len) <= 0 || !iflag) { P->bail = 1; return NULL; }
+        P->i += len;
+        Node *u = fold_node(cp);
+        if (!u) { P->bail = 1; return NULL; }
+        return u;
+    }
     if (c == '.') { P->i++; return make_any(); }
     if (c == '[') return parse_bracket(P);
     if (P->ere) {
@@ -585,32 +779,192 @@ static int literal_branch(const char *s, size_t n)
     return 1;
 }
 
-/* longest literal that every match must contain */
-static void consider(const char *s, size_t n, char **best, size_t *bl)
+static double fb_prob(int b);
+
+/* A required piece is a literal every match contains.  req_lit keeps the
+ * longest (the multi-branch filter wants >= 3 bytes).  req_rare keeps the
+ * rarest by fb_prob(), which is what makes BRE th[a-z]+ scan for '+'. */
+typedef struct {
+    char *s;
+    size_t n;
+    double q;
+    int icase;
+    int nruns;
+    int letter1;
+    int other;
+} LitPick;
+typedef struct {
+    void (*fn)(const char *s, size_t n, int icase, void *ud);
+    void *ud;
+    int saw_dot;
+} ReqWalk;
+
+static int set_singleton(const Node *n, unsigned char *c)
 {
-    if (n > *bl) {
-        free(*best);
-        *best = xrealloc(NULL, n + 1);
-        memcpy(*best, s, n);
-        (*best)[n] = 0;
-        *bl = n;
+    if (n->type != N_SET || n->mb) return 0;
+    int cnt = 0;
+    unsigned char one = 0;
+    for (int b = 0; b < 256; b++) {
+        if (!hasbit(n->set, b)) continue;
+        if (++cnt > 1) return 0;
+        one = (unsigned char)b;
+    }
+    if (!cnt) return 0;
+    *c = one;
+    return 1;
+}
+static int set_casepair(const Node *n, unsigned char *lower)
+{
+    if (n->type != N_SET || n->mb) return 0;
+    int cnt = 0, first = -1, second = -1;
+    for (int b = 0; b < 256; b++) {
+        if (!hasbit(n->set, b)) continue;
+        if (cnt == 0) first = b;
+        else if (cnt == 1) second = b;
+        if (++cnt > 2) return 0;
+    }
+    if (cnt == 2 && first >= 'A' && first <= 'Z' && second == first + 32) {
+        *lower = (unsigned char)second;
+        return 1;
+    }
+    return 0;
+}
+static int is_any_set(const Node *n)
+{
+    if (!n || n->type != N_SET) return 0;
+    if (n->mb) return 1;
+    int cnt = 0;
+    for (int w = 0; w < 4; w++) cnt += __builtin_popcountll(n->set[w]);
+    return cnt >= 128;
+}
+static int collect_bytes(const Node *n, char *buf, size_t cap, size_t *len)
+{
+    if (n->type == N_LIT) {
+        if (*len >= cap) return 0;
+        buf[(*len)++] = (char)n->c;
+        return 1;
+    }
+    if (n->type != N_CAT) return 0;
+    for (int k = 0; k < n->nkid; k++)
+        if (!collect_bytes(n->kid[k], buf, cap, len)) return 0;
+    return 1;
+}
+static void req_visit(const Node *n, ReqWalk *w);
+static void alt_prefix(const Node *n, ReqWalk *w)
+{
+    if (n->nkid < 1 || n->nkid > 32) return;
+    char bufs[32][64];
+    size_t lens[32];
+    for (int k = 0; k < n->nkid; k++) {
+        lens[k] = 0;
+        if (!collect_bytes(n->kid[k], bufs[k], 64, &lens[k])) return;
+    }
+    size_t L = lens[0];
+    for (int k = 1; k < n->nkid && L; k++) {
+        if (lens[k] < L) L = lens[k];
+        while (L && memcmp(bufs[0], bufs[k], L)) L--;
+    }
+    if (L) w->fn(bufs[0], L, 0, w->ud);
+}
+static void req_visit(const Node *n, ReqWalk *w)
+{
+    if (!n) return;
+    if (n->type == N_STAR || n->type == N_PLUS) {
+        if (is_any_set(n->kid[0])) w->saw_dot = 1;
+        if (n->type == N_PLUS) req_visit(n->kid[0], w);
+        return;
+    }
+    if (n->type == N_QUES || n->type == N_EMPTY) return;
+    if (n->type == N_ALT) { alt_prefix(n, w); return; }
+    if (n->type != N_CAT) {
+        unsigned char ch;
+        if (n->type == N_LIT) { char c = (char)n->c; w->fn(&c, 1, 0, w->ud); }
+        else if (set_casepair(n, &ch)) { char c = (char)ch; w->fn(&c, 1, 1, w->ud); }
+        else if (set_singleton(n, &ch)) { char c = (char)ch; w->fn(&c, 1, 0, w->ud); }
+        return;
+    }
+    size_t cap = (size_t)n->nkid + 8, rl = 0;
+    char *run = xrealloc(NULL, cap);
+    int ic = 0;
+    for (int k = 0; k < n->nkid; k++) {
+        Node *c = n->kid[k];
+        unsigned char ch;
+        int add = 0, ici = 0;
+        if (c->type == N_LIT) { ch = c->c; add = 1; }
+        else if (set_casepair(c, &ch)) { add = 1; ici = 1; }
+        else if (set_singleton(c, &ch)) add = 1;
+        if (add) {
+            if (rl + 1 >= cap) { cap *= 2; run = xrealloc(run, cap); }
+            run[rl++] = (char)ch;
+            ic |= ici;
+            continue;
+        }
+        if (rl) { w->fn(run, rl, ic, w->ud); rl = 0; ic = 0; }
+        if (c->type == N_PLUS || c->type == N_CAT || c->type == N_ALT || c->type == N_STAR)
+            req_visit(c, w);
+    }
+    if (rl) w->fn(run, rl, ic, w->ud);
+    free(run);
+}
+static void acc_long(const char *s, size_t n, int icase, void *ud)
+{
+    (void)icase;
+    LitPick *a = ud;
+    if (n > a->n) {
+        free(a->s);
+        a->s = xrealloc(NULL, n + 1);
+        memcpy(a->s, s, n);
+        a->s[n] = 0;
+        a->n = n;
+    }
+}
+static int ascii_letter(unsigned char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+static void acc_rare(const char *s, size_t n, int icase, void *ud)
+{
+    LitPick *a = ud;
+    double q = 1;
+    for (size_t i = 0; i < n; i++) q *= fb_prob((unsigned char)s[i]);
+    if (n == 1 && ascii_letter((unsigned char)s[0])) a->letter1 = 1;
+    else a->other = 1;
+    a->nruns++;
+    if (!a->s || q < a->q || (q == a->q && n > a->n)) {
+        free(a->s);
+        a->s = xrealloc(NULL, n + 1);
+        memcpy(a->s, s, n);
+        a->s[n] = 0;
+        a->n = n;
+        a->q = q;
+        a->icase = icase;
     }
 }
 static void req_lit(Node *n, char **best, size_t *bl)
 {
-    if (n->type == N_PLUS) { req_lit(n->kid[0], best, bl); return; }
-    if (n->type != N_CAT) return;
-    char *run = xrealloc(NULL, (size_t)n->nkid + 1);
-    size_t rl = 0;
-    for (int k = 0; k < n->nkid; k++) {
-        Node *c = n->kid[k];
-        if (c->type == N_LIT) { run[rl++] = (char)c->c; continue; }
-        consider(run, rl, best, bl);
-        rl = 0;
-        req_lit(c, best, bl);
+    LitPick a = {0};
+    ReqWalk w = {acc_long, &a, 0};
+    req_visit(n, &w);
+    *best = a.s;
+    *bl = a.n;
+}
+/* Single-letter runs on both sides of an unbounded '.' are not a filter.
+ * a.*z stays on the streaming DFA.  z.+ still filters on z. */
+static char *req_rare(Node *n, size_t *bl, int *icase)
+{
+    LitPick a = {0};
+    a.q = 2;
+    ReqWalk w = {acc_rare, &a, 0};
+    req_visit(n, &w);
+    if (w.saw_dot && a.letter1 && !a.other && a.nruns >= 2) {
+        free(a.s);
+        *bl = 0;
+        *icase = 0;
+        return NULL;
     }
-    consider(run, rl, best, bl);
-    free(run);
+    *bl = a.n;
+    *icase = a.icase;
+    return a.s;
 }
 
 /* ================= NFA ================= */
@@ -1199,44 +1553,11 @@ static int span_next(const char *l, size_t n, size_t from, size_t *ms, size_t *m
     *ms = bs; *me = be;
     return 1;
 }
-/* Longest run of top-level literal / case-pair nodes of the single branch,
- * returned lowercased.  Only used for -i. */
-static char *req_lit_ci(Node *n, size_t *bl)
-{
-    *bl = 0;
-    if (n->type != N_CAT) return NULL;
-    char *best = NULL, *run = xrealloc(NULL, (size_t)n->nkid + 1);
-    size_t rl = 0;
-    for (int k = 0; k <= n->nkid; k++) {
-        int ch = -1;
-        if (k < n->nkid) {
-            Node *x = n->kid[k];
-            if (x->type == N_LIT) ch = x->c < 0x80 ? x->c : -1;
-            else if (x->type == N_SET) {
-                int cnt = 0, first = -1, second = -1;
-                for (int b = 0; b < 256 && cnt < 3; b++)
-                    if ((x->set[b >> 6] >> (b & 63)) & 1) { if (cnt == 0) first = b; else second = b; cnt++; }
-                if (cnt == 2 && !x->mb && first >= 'A' && first <= 'Z' && second == first + 32) ch = second;
-            }
-        }
-        if (ch >= 0) { run[rl++] = (char)ch; continue; }
-        if (rl > *bl) {
-            free(best);
-            best = xrealloc(NULL, rl + 1);
-            memcpy(best, run, rl);
-            best[rl] = 0;
-            *bl = rl;
-        }
-        rl = 0;
-    }
-    free(run);
-    return best;
-}
 static int pure_lit(Node *n, size_t *len);
 /* -w with a pure-literal word set: a literal made only of word characters matches
  * as a whole word iff it equals a maximal word token of the line, so the check is
  * a hash lookup per token instead of a libc regex over a giant alternation. */
-static char **ws_lit; static size_t *ws_len, ws_cap; static int wset_on;
+static char **ws_lit; static size_t *ws_len, ws_cap; static int wset_on, ws_icase;
 static inline int isw(unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 static inline size_t ws_hash(const char *p, size_t n)
 {
@@ -1253,8 +1574,27 @@ static void wset_add(const char *p, size_t n)
     }
     ws_lit[i] = xrealloc(NULL, n + 1); memcpy(ws_lit[i], p, n); ws_len[i] = n;
 }
+static int wset_load(char **strs, size_t *lens, size_t n, int icase)
+{
+    if (!n) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!lens[i]) return 0;
+        for (size_t k = 0; k < lens[i]; k++)
+            if (!isw((unsigned char)strs[i][k])) return 0;
+    }
+    ws_cap = 16;
+    while (ws_cap < n * 2) ws_cap <<= 1;
+    ws_lit = calloc(ws_cap, sizeof *ws_lit);
+    ws_len = calloc(ws_cap, sizeof *ws_len);
+    if (!ws_lit || !ws_len) die("out of memory");
+    for (size_t i = 0; i < n; i++) wset_add(strs[i], lens[i]);
+    ws_icase = icase;
+    wset_on = 1;
+    return 1;
+}
 static void wset_build(void)
 {
+    if (wset_on) return;
     size_t total = 0;
     for (int i = 0; i < nbr; i++) {
         size_t L;
@@ -1286,9 +1626,20 @@ static int wset_check(const char *l, size_t n)
         size_t j = i + 1;
         while (j < n && isw((unsigned char)l[j])) j++;
         if (j < n && (unsigned char)l[j] >= 0x80) return -1;
-        size_t h = ws_hash(l + i, j - i) & (ws_cap - 1);
+        const char *tok = l + i;
+        size_t tn = j - i;
+        char buf[512];
+        if (ws_icase) {
+            if (tn >= sizeof buf) return -1;
+            for (size_t k = 0; k < tn; k++) {
+                unsigned char x = (unsigned char)tok[k];
+                buf[k] = (x >= 'A' && x <= 'Z') ? (char)(x | 0x20) : (char)x;
+            }
+            tok = buf;
+        }
+        size_t h = ws_hash(tok, tn) & (ws_cap - 1);
         while (ws_lit[h]) {
-            if (ws_len[h] == j - i && !memcmp(ws_lit[h], l + i, j - i)) return 1;
+            if (ws_len[h] == tn && !memcmp(ws_lit[h], tok, tn)) return 1;
             h = (h + 1) & (ws_cap - 1);
         }
         i = j;
@@ -1406,6 +1757,72 @@ static int lset_next(const char *l, size_t n, size_t from, size_t *ms, size_t *m
         if (best) { *ms = i; *me = i + best; return 1; }
     }
     return 0;
+}
+/* \bWORD\b|\bWORD\b (and \<WORD\>) is -w of those words.  One unwrapped branch
+ * leaves the original pattern on the normal path. */
+static int piece_end(const char *s, size_t n, size_t i, int ere, size_t *hi, size_t *next)
+{
+    int bracket = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\' && i + 1 < n) {
+            if (!ere && !bracket && s[i + 1] == '|') { *hi = i; *next = i + 2; return 1; }
+            i += 2;
+            continue;
+        }
+        if (c == '[') { bracket = 1; i++; continue; }
+        if (c == ']' && bracket) { bracket = 0; i++; continue; }
+        if (ere && !bracket && c == '|') { *hi = i; *next = i + 1; return 1; }
+        i++;
+    }
+    if (bracket) return -1;
+    *hi = n;
+    *next = n;
+    return 0;
+}
+static int peel_wb(const char *p, size_t n, size_t *lo, size_t *hi)
+{
+    if (n < 5) return 0;
+    int b = p[0] == '\\' && p[1] == 'b' && p[n - 2] == '\\' && p[n - 1] == 'b';
+    int a = p[0] == '\\' && p[1] == '<' && p[n - 2] == '\\' && p[n - 1] == '>';
+    if (!a && !b) return 0;
+    for (size_t k = 2; k + 2 < n; k++) if (!isw((unsigned char)p[k])) return 0;
+    *lo = 2;
+    *hi = n - 2;
+    return *hi > *lo;
+}
+static int rewrite_wb(void)
+{
+    if (wflag || xflag || Fflag || !npat) return 0;
+    char **nw = NULL;
+    size_t *nl = NULL, nn = 0;
+    for (size_t pi = 0; pi < npat; pi++) {
+        const char *s = fx[pi];
+        size_t n = fxlen[pi], i = 0;
+        for (;;) {
+            size_t hi, next, lo, end;
+            int more = piece_end(s, n, i, Eflag, &hi, &next);
+            if (more < 0 || !peel_wb(s + i, hi - i, &lo, &end)) {
+                for (size_t k = 0; k < nn; k++) free(nw[k]);
+                free(nw); free(nl);
+                return 0;
+            }
+            size_t wn = end - lo;
+            nw = xrealloc(nw, (nn + 1) * sizeof *nw);
+            nl = xrealloc(nl, (nn + 1) * sizeof *nl);
+            nw[nn] = xrealloc(NULL, wn + 1);
+            memcpy(nw[nn], s + i + lo, wn);
+            nw[nn][wn] = 0;
+            nl[nn++] = wn;
+            if (!more) break;
+            i = next;
+        }
+    }
+    for (size_t k = 0; k < npat; k++) free(fx[k]);
+    free(fx); free(fxlen);
+    fx = nw; fxlen = nl; npat = nn;
+    wflag = 1;
+    return 1;
 }
 static int wcheck(const char *l, size_t n)          /* exact -w verification */
 {
@@ -2302,16 +2719,51 @@ static void ac_build(void)
     }
     free(q);
 }
+#if defined(__x86_64__)
+__attribute__((target("avx2"), noinline))
+static void fold_avx2(char *o, const char *s, size_t n)
+{
+    const __m256i A = _mm256_set1_epi8('A' - 1);
+    const __m256i Z = _mm256_set1_epi8('Z' + 1);
+    const __m256i sp = _mm256_set1_epi8(0x20);
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(s + i));
+        __m256i m = _mm256_and_si256(_mm256_cmpgt_epi8(v, A), _mm256_cmpgt_epi8(Z, v));
+        v = _mm256_or_si256(v, _mm256_and_si256(m, sp));
+        _mm256_storeu_si256((__m256i *)(o + i), v);
+    }
+    for (; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        o[i] = (c >= 'A' && c <= 'Z') ? (char)(c | 0x20) : (char)c;
+    }
+}
+#endif
+static void fold_copy(char *o, const char *s, size_t n)
+{
+#if defined(__x86_64__)
+    if (__builtin_cpu_supports("avx2")) { fold_avx2(o, s, n); return; }
+#endif
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        o[i] = (c >= 'A' && c <= 'Z') ? (char)(c | 0x20) : (char)c;
+    }
+}
 static void scan_ac(Chunk *c, size_t begin, size_t end)
 {
     const char *d = c->job->data;
+    char *fold = NULL;
+    if (mlit_icase) {
+        fold = xrealloc(NULL, end - begin + 1);
+        fold_copy(fold, d + begin, end - begin);
+    }
     size_t pos = begin, cnt = 0, cnt_pos = begin, count = 0;
-    int s = 0;
+    int st = 0;
     while (pos < end) {
-        unsigned char b = (unsigned char)d[pos];
-        if (b == '\n') { s = 0; pos++; continue; }
-        s = ac[s].nxt[b];
-        if (!ac[s].hit) { pos++; continue; }
+        unsigned char b = fold ? (unsigned char)fold[pos - begin] : (unsigned char)d[pos];
+        if (b == '\n') { st = 0; pos++; continue; }
+        st = ac[st].nxt[b];
+        if (!ac[st].hit) { pos++; continue; }
         size_t ls = pos;
         while (ls > begin && d[ls - 1] != '\n') ls--;
         const char *nl = memchr(d + pos, '\n', end - pos);
@@ -2324,13 +2776,14 @@ static void scan_ac(Chunk *c, size_t begin, size_t end)
             push_match(c, ls, le - ls, ln);
         }
         pos = le < end ? le + 1 : end;
-        s = 0;
+        st = 0;
     }
     if (nflag) {
         cnt += count_nl(d + cnt_pos, end - cnt_pos);
         if (end > begin && d[end - 1] != '\n') cnt++;
         c->nlines = cnt;
     }
+    free(fold);
     c->count = count;
 }
 
@@ -2372,13 +2825,22 @@ static void scan_multi_literal(Chunk *c, Matcher *M, size_t begin, size_t end)
 {
     if (mlit_exact && !exact_filter) { scan_ac(c, begin, end); return; }
     const char *d = c->job->data;
+    char *fold = NULL;
+    const char *view = d;
+    size_t voff = 0;
+    if (mlit_icase) {
+        fold = xrealloc(NULL, end - begin + 1);
+        fold_copy(fold, d + begin, end - begin);
+        view = fold;
+        voff = begin;
+    }
     size_t pos = begin, cnt = 0, cnt_pos = begin, count = 0;
     MCache *cache = calloc(nmlit, sizeof *cache);
     if (!cache) die("out of memory");
     while (pos < end) {
-        const char *h = find_mlit(d + pos, end - pos, cache);
+        const char *h = find_mlit(view + (pos - voff), end - pos, cache);
         if (!h) break;
-        size_t hp = (size_t)(h - d);
+        size_t hp = (size_t)(h - view) + voff;
         /* -c/-l/-q on an exact literal set only needs the line end. The
          * backward scan is for verify, -n, or stored output. */
         int need_ls = !mlit_exact || store_matches || nflag;
@@ -2401,6 +2863,7 @@ static void scan_multi_literal(Chunk *c, Matcher *M, size_t begin, size_t end)
         c->nlines = cnt;
     }
     free(cache);
+    free(fold);
     c->count = count;
 }
 
@@ -4016,7 +4479,7 @@ static void print_help(void)
 }
 static void print_version(void)
 {
-    printf("%s 1.3.1\nA multi-threaded POSIX/GNU-style grep.\n", prog);
+    printf("%s 1.3.2\nA multi-threaded POSIX/GNU-style grep.\n", prog);
 }
 static long parse_num(const char *s, const char *what)
 {
@@ -4069,6 +4532,39 @@ static const char *progname(const char *a0)
     const char *s = strrchr(a0, '/');
     s = s ? s + 1 : a0;
     return *s ? s : "cg";
+}
+
+/* Case-folded Teddy, hash and wm read a lowercased copy of the window.
+ * That copy loses to the case-folded DFA as soon as any literal is common:
+ * the letter model prices "the" at about 0.00026, and w100 sums to 0.0008,
+ * just under the exact_filter cutoff, but both hit on almost every line.
+ * Stay on the DFA above 0.0001. Rare sets (a long-word list at ~1e-10) keep
+ * the folded scanners. A -w set that would drop its own prefilter does too. */
+static int mlit_filter_worth(void)
+{
+    if (nmlit < 2) return 1;
+    double dens = 0;
+    size_t nlong = 0, mn = (size_t)-1;
+    int all8 = 1;
+    for (size_t i = 0; i < nmlit; i++) {
+        double q = 1;
+        for (size_t k = 0; k < mlits[i].n; k++)
+            q *= fb_prob((unsigned char)mlits[i].p[k]);
+        dens += q;
+        if (mlits[i].n >= 3) nlong++;
+        if (mlits[i].n < mn) mn = mlits[i].n;
+        if (mlits[i].n < 8) all8 = 0;
+    }
+    int filt = 0;
+    if (!nlong) filt = 1;
+    else if (mn >= 3 && (nmlit <= TEDDY_LIMIT || all8 || nmlit >= 5)) filt = 1;
+    if (filt && dens > 0.0001) filt = 0;
+    if (wflag) {
+        size_t cap = 16;
+        while (cap < nmlit * 2) cap <<= 1;
+        if (dens > 0.0005 || cap > 64) filt = 0;
+    }
+    return filt;
 }
 
 int main(int argc, char **argv)
@@ -4210,37 +4706,79 @@ int main(int argc, char **argv)
      * worker removes the overlap and is slower. Several workers format at once. */
     plain_prefmt = nthreads > 1 && store_matches && !color_on && !oflag && maxcount < 0 && !ctx_on();
 
-    /* \bWORD\b and \<WORD\> over plain word characters mean exactly -w WORD:
-     * run them on the same fast path (token lookup) instead of libc regex. */
-    if (!wflag && !xflag && !Fflag && npat) {
-        int all = 1;
-        for (size_t i = 0; i < npat && all; i++) {
-            const char *p = fx[i]; size_t n = fxlen[i];
-            int ok = 0;
-            if (n > 4 && p[0] == '\\' && ((p[1] == 'b' && p[n - 2] == '\\' && p[n - 1] == 'b') ||
-                                          (p[1] == '<' && p[n - 2] == '\\' && p[n - 1] == '>'))) {
-                ok = 1;
-                for (size_t k = 2; k < n - 2; k++) {
-                    unsigned char c = (unsigned char)p[k];
-                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')) ok = 0;
+    /* \bWORD\b|\bWORD\b (and a single \bWORD\b) is -w of those words. */
+    rewrite_wb();
+    /* -F -i over ASCII: lowercase the literals and the scanned window so Teddy,
+     * the prefix hash and Aho-Corasick stay byte-exact. */
+    int fici = 0;
+    if (Fflag && iflag && !xflag && !vflag && npat) {
+        int ascii = 1;
+        for (size_t i = 0; i < npat && ascii; i++)
+            for (size_t k = 0; k < fxlen[i]; k++)
+                if ((unsigned char)fx[i][k] >= 0x80) ascii = 0;
+        if (ascii) {
+            mlits = xrealloc(NULL, npat * sizeof *mlits);
+            nmlit = npat;
+            mlit_exact = 1;
+            for (size_t i = 0; i < npat; i++) {
+                char *bp = xrealloc(NULL, fxlen[i] + 1);
+                for (size_t k = 0; k < fxlen[i]; k++) {
+                    unsigned char c = (unsigned char)fx[i][k];
+                    bp[k] = (c >= 'A' && c <= 'Z') ? (char)(c | 0x20) : (char)c;
+                }
+                bp[fxlen[i]] = 0;
+                mlits[i].p = bp;
+                mlits[i].n = fxlen[i];
+                mlits[i].r = 0;
+                for (size_t k = 1; k < fxlen[i]; k++)
+                    if (commonness((unsigned char)bp[k]) < commonness((unsigned char)bp[mlits[i].r]))
+                        mlits[i].r = k;
+            }
+            int words = 1;
+            if (wflag) {
+                for (size_t i = 0; i < nmlit && words; i++) {
+                    if (!mlits[i].n) words = 0;
+                    for (size_t k = 0; k < mlits[i].n && words; k++)
+                        if (!isw((unsigned char)mlits[i].p[k])) words = 0;
                 }
             }
-            if (!ok) all = 0;
-        }
-        if (all) {
-            for (size_t i = 0; i < npat; i++) {
-                size_t n = fxlen[i] - 4;
-                memmove(fx[i], fx[i] + 2, n);
-                fx[i][n] = 0;
-                fxlen[i] = n;
+            /* Dense common-word sets stay on the DFA. Sparse sets keep the
+             * folded literal scanners. */
+            if (mlit_filter_worth() && (!wflag || words)) {
+                if (wflag) {
+                    char **ps = xrealloc(NULL, nmlit * sizeof *ps);
+                    size_t *ls = xrealloc(NULL, nmlit * sizeof *ls);
+                    for (size_t i = 0; i < nmlit; i++) { ps[i] = mlits[i].p; ls[i] = mlits[i].n; }
+                    words = wset_load(ps, ls, nmlit, 1);
+                    free(ps); free(ls);
+                }
             }
-            wflag = 1;
+            if (words && mlit_filter_worth() && (!wflag || wset_on)) {
+                if (nmlit == 1) {
+                    set_literal(mlits[0].p, mlits[0].n, wflag ? 1 : 0);
+                    lit_icase = mlits[0].n > 0;
+                    free(mlits[0].p);
+                    free(mlits);
+                    mlits = NULL;
+                    nmlit = 0;
+                    mlit_icase = 0;
+                } else {
+                    mlit_icase = 1;
+                    mlit_exact = wflag ? 0 : 1;
+                }
+                fici = 1;
+            } else {
+                for (size_t i = 0; i < nmlit; i++) free(mlits[i].p);
+                free(mlits);
+                mlits = NULL;
+                nmlit = 0;
+            }
         }
     }
     /* engine selection */
     int use_fast = Fflag && !iflag;
     int litset = 0;
-    engine = ENG_REGEX;
+    engine = fici ? ENG_FAST : ENG_REGEX;
     /* Plain words (fixed strings, or ERE/BRE with no metacharacters) never
      * need the NFA. Building it used to exceed MAX_NFA and silently fall
      * back to one libc regex per pattern. */
@@ -4262,7 +4800,9 @@ int main(int argc, char **argv)
     }
     if (!litset && !vflag && !iflag && !xflag && !wflag && !Fflag)
         litset = collect_pure_alternation();
-    if (litset && nmlit > 1) engine = ENG_FAST;
+    if (fici) {
+        /* ASCII -F -i already selected ENG_FAST */
+    } else if (litset && nmlit > 1) engine = ENG_FAST;
     else if (litset && nmlit == 1) {
         set_literal(mlits[0].p, mlits[0].n, 0);
         engine = ENG_FAST;
@@ -4273,12 +4813,13 @@ int main(int argc, char **argv)
     if ((oflag || color_on || wflag) && !(oflag || color_on)) (void)span_compile();   /* -w alone: validate up front */
     else if ((oflag || color_on) && !(wflag && wset_on)) { /* lset decided below; validate only if it is not used */ }
     if (!vflag && !litset) {
-        if (engine == ENG_FAST && npat == 1 && !xflag && fxlen[0] > 0) {
+        if (engine == ENG_FAST && npat == 1 && !xflag && fxlen[0] > 0 && !lit) {
             set_literal(fx[0], fxlen[0], 0);
         } else if (engine == ENG_DFA && iflag && !xflag && nbr == 1 && !br[0].bol) {
             size_t bl = 0;
-            char *best = req_lit_ci(br[0].n, &bl);
-            if (best && lit_worth(best, bl)) { set_literal(best, bl, 1); lit_icase = 1; }
+            int ic = 0;
+            char *best = req_rare(br[0].n, &bl, &ic);
+            if (best && lit_worth(best, bl)) { set_literal(best, bl, 1); lit_icase = ic; }
             free(best);
         } else if (engine == ENG_DFA && !iflag && !xflag) {
             /* If every branch has a required literal, use their union as a
@@ -4328,8 +4869,9 @@ int main(int argc, char **argv)
                 free(mlits); mlits = NULL; nmlit = 0;
                 char *best = NULL; size_t bl = 0;
                 if (nbr == 1) {
-                    req_lit(br[0].n, &best, &bl);
-                    if (lit_worth(best, bl)) set_literal(best, bl, 1);
+                    int ic = 0;
+                    best = req_rare(br[0].n, &bl, &ic);
+                    if (best && lit_worth(best, bl)) { set_literal(best, bl, 1); lit_icase = ic; }
                 }
                 free(best);
             }

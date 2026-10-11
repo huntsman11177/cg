@@ -174,3 +174,19 @@ Same machine and warm `en.txt` as the 1.3.0 snapshot. One run each, stdout disca
 Against the 1.3.0 snapshot above, `-n 'e.e.e'` went from 11.63 s / 2.67 s to 5.94 s / 1.43 s, and `-v -n 'e.e.e'` went from 14.92 s / 8.52 s to 9.68 s / 2.90 s. `-o 'e.e.e'` and `-n 'a.*z'` dropped by about the same factor at one thread. `-n zzyzx` did not move. Those two snapshots are separate warm runs, not a paired retime of the 1.3.0 binary.
 
 The 189,916-pattern fixed-string count, `-F -j1 -c`, returned `336142718` in 3.85 s. `-F -j8 -c the` returned `63651604` in 0.75 s. The literal scanners were not changed.
+
+## 1.3.2 snapshot (2026-10-11)
+
+Same machine, powersave governor, warm `en.txt` (9968530111 bytes). `cg` 1.3.2 and a 1.3.1 binary built with the same `-O3 -Wall -Wextra -pthread` flags were timed back to back with `/usr/bin/time`. The table is user time, then wall time. Counts matched between the two binaries at `-j1` and `-j8`. ripgrep 15.2.0 is one run, default threads, from the same warm cache as the first block of rows.
+
+| Command | 1.3.2 -j1 | 1.3.1 -j1 | 1.3.2 -j8 wall | 1.3.1 -j8 wall | Lines |
+|---|---:|---:|---:|---:|---:|
+| `th[a-z]+` | 0.46 s (0.56 s) | 15.04 s (15.18 s) | 0.48 s | 3.06 s | 1 |
+| `-E -w '[a-z]+ing'` | 8.03 s (8.16 s) | 7.96 s (8.10 s) | 1.76 s | 1.75 s | 43627832 |
+| `-E 'a.*z'` | 5.41 s (5.52 s) | 5.47 s (5.58 s) | 1.27 s | 1.26 s | 3406053 |
+| `-F -i -f` 100 common words | 9.79 s (9.91 s) | 10.01 s (10.14 s) | 2.36 s | 2.39 s | 176537739 |
+| `-F -i -w -f` 100 common words | 127.88 s (128.52 s) | 125.44 s (126.10 s) | 30.95 s | 30.35 s | 159568380 |
+| `-E` 100× `\bword\b` | 208.57 s (209.55 s) | 214.82 s (215.73 s) | 47.30 s | 50.63 s | 135492849 |
+| `-E -f HARD_REAL_10000.regex` | 11.66 s (11.81 s) | 12.16 s (12.31 s) | 2.78 s | 2.77 s | 11744376 |
+
+`th[a-z]+` is a basic expression, so `+` is literal. That is the same search GNU grep runs, and it is not the ripgrep search. ripgrep on the comparable rows in this session: `-E -w '[a-z]+ing'` 6.60 s wall (43626703 lines; ripgrep's `[a-z]` is ASCII), `-E 'a.*z'` 11.93 s wall (same 3406053 lines), `-F -i -f` 100 words 16.10 s wall (same count). No other row in the paired run was more than 3% slower in user time than 1.3.1. The literal scanners were not retuned.

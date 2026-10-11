@@ -74,6 +74,10 @@ Each worker owns its regex state. The source explicitly avoids sharing a `regex_
 
 ## Literal prefilters
 
+A regex prefilter keeps one contiguous literal that every match must contain, and it keeps the rarest such run by the English letter-frequency table. Basic `th[a-z]+` therefore scans for `+`. An alternation contributes only the literal prefix shared by every branch. Two single letters split by `.*`, as in `a.*z`, produce no prefilter. ASCII `-i` folds a letter into the lowercase byte of its case pair, and folds `[a-z]` to `[a-zA-Z]` at parse time, so the same prefilter applies. Simple Unicode case pairs become UTF-8 alternatives in the DFA. A fold that is not a single code point stays on libc.
+
+ASCII `-F -i` lowercases the needles. A sparse set is scanned with the byte matchers below on a lowercased copy of the window. A dense set of common words stays on the case-folded DFA, because the extra copy costs more than it saves.
+
 The literal matcher uses several levels of filtering.
 
 ### Small literal sets

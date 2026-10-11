@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.2
+
+- The regex prefilter keeps the rarest literal that every match must contain, ranked with the English letter-frequency table. Basic `th[a-z]+` scans for the literal `+`. An alternation contributes only a shared literal prefix. `a.*z` stays on the streaming DFA.
+- A pattern whose every branch is `\bWORD\b` or `\<WORD\>` is rewritten to `-w` of those words. A mixed branch, or a `|` in a basic expression, is left unchanged.
+- ASCII `-F -i` lowercases the literals. A sparse set is searched with Teddy, the prefix hash, or Aho-Corasick on a lowercased window. A dense word list stays on the case-folded DFA.
+- Simple one-to-one Unicode case pairs in Latin, Greek, and Cyrillic are compiled as UTF-8 alternatives in the DFA. `ß`, `İ`, and `ſ` still use libc, matching GNU grep.
+- `-i` on an ASCII character class was already folded at parse time, so `[a-z]` under `-i` is `[a-zA-Z]` and can feed the same prefilter.
+
+Warm `en.txt` timings against 1.3.1 are in `docs/BENCHMARKS.md`. The fixed-string count for `HARD_REAL_10000` is unchanged at 11744376.
+
 ## 1.3.1
 
 - Plain output with more than one worker is formatted in the worker that searched the chunk. The printer writes the finished buffers in order. One worker still formats in the printer, so search and output overlap.
