@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.3
+
+- `-w` on the word-bounded DFA streams. A byte at or above `0x80` in a multibyte locale still ends that line and the line is decided separately.
+- When every pattern atom is plain ASCII, a non-ASCII `-w` line is decided by the same DFA. Each UTF-8 character becomes one placeholder byte, a word byte or a non-word byte. Invalid UTF-8, a non-ASCII literal, a negated class, or a named class still goes to libc.
+- Whole-word sets pack tokens of at most 8 bytes into one key. On AVX2 the scan classifies 64-byte blocks. A token that ends on a block boundary no longer drops the later tokens in that block.
+
+On a warm 9.97 GB `en.txt`, `-j1 -c -E -w '[a-z]+e'` took 9.57 s and `'[a-z]+s'` took 8.03 s. ripgrep 15.2.0 took 19.97 s and 19.31 s on the same hot cache. Counts are 164108077 and 90951565. ripgrep reports 164108072 and 90951559. The literal scanners were not changed.
+
 ## 1.3.2
 
 - The regex prefilter keeps the rarest literal that every match must contain, ranked with the English letter-frequency table. Basic `th[a-z]+` scans for the literal `+`. An alternation contributes only a shared literal prefix. `a.*z` stays on the streaming DFA.

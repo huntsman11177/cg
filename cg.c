@@ -67,6 +67,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <wctype.h>
 
 #define CHUNK_DEFAULT ((size_t)4 << 20)
 static size_t chunk_size = CHUNK_DEFAULT;
@@ -77,6 +78,7 @@ static int nfa_limit = MAX_NFA;   /* raised for huge pure-literal alternations *
 #define TABSZ 8192         /* hash slots (power of 2, > 2*MAXD) */
 #define UNK 0xFFFF
 #define TERM 0x8000
+#define HIV  0xFFFD                 /* streaming -w in a multibyte locale: byte >= 0x80, the line goes to libc */
 #define NLV  0xFFFE                 /* streaming: newline marker (TERM set, never a real id) */
 
 typedef struct { size_t off, len, lineno; } Match;
@@ -109,6 +111,7 @@ typedef struct FileJob {
     int msg;                   /* small output is the "binary file matches" message */
     int failed;                /* open/read error: print nothing for this file */
     int isdir;                 /* operand is a directory: -c prints 0, -L lists it */
+    int known_reg;             /* walk saw a regular file: skip the extra fstat */
     int small;                 /* processed whole by one worker, output preformatted */
     size_t total;              /* match count (small mode) */
     char *out;
@@ -1065,6 +1068,7 @@ static void closure(Matcher *M, int s, Set *o)
         }
     }
 }
+static int stream_hi;
 static void make_init(Matcher *M);
 static void reset_cache(Matcher *M);
 static uint16_t tag(Matcher *M, uint16_t id)
@@ -1131,6 +1135,7 @@ static uint16_t intern(Matcher *M, Set *t)
          * at init (always id 0, including while that state is being created) so
          * the fast loop does not stop on every line. */
         M->sflat[((size_t)id << 8) | '\n'] = t->endacc ? (uint16_t)NLV : (M->nds == 1 ? id : M->init);
+        if (stream_hi) for (unsigned hb = 0x80; hb < 0x100; hb++) M->sflat[((size_t)id << 8) | hb] = HIV;
     }
     d->n = t->n;
     d->ids = xrealloc(NULL, (size_t)t->n * sizeof(int) + 1);
@@ -1186,7 +1191,7 @@ static uint16_t compute(Matcher *M, uint16_t s, unsigned char b)
     }
     uint32_t ep = M->epoch;
     uint16_t r = intern(M, &t);
-    if (ep == M->epoch) { M->ds[s].next[b] = r; if (M->sflat && b != '\n') M->sflat[((size_t)s << 8) | b] = r; }
+    if (ep == M->epoch) { M->ds[s].next[b] = r; if (M->sflat && b != '\n' && !(stream_hi && b >= 0x80)) M->sflat[((size_t)s << 8) | b] = r; }
     return r;
 }
 static int dfa_match(Matcher *M, const unsigned char *p, size_t n)
@@ -1565,6 +1570,7 @@ static inline size_t ws_hash(const char *p, size_t n)
     for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)p[i]) * 1099511628211ULL;
     return (size_t)(h ^ (h >> 29));
 }
+static void wset_fast_init(void);
 static void wset_add(const char *p, size_t n)
 {
     size_t i = ws_hash(p, n) & (ws_cap - 1);
@@ -1590,6 +1596,7 @@ static int wset_load(char **strs, size_t *lens, size_t n, int icase)
     for (size_t i = 0; i < n; i++) wset_add(strs[i], lens[i]);
     ws_icase = icase;
     wset_on = 1;
+    wset_fast_init();
     return 1;
 }
 static void wset_build(void)
@@ -1614,25 +1621,82 @@ static void wset_build(void)
         wset_add(buf, m);
     }
     wset_on = 1;
+    wset_fast_init();
 }
-/* 1 = some token is a pattern, 0 = none, -1 = line has non-ASCII bytes: ask the regex */
-static int wset_check(const char *l, size_t n)
+/* Fast token lookup.  Tokens of up to 8 bytes are packed into one 64-bit key (case
+ * folded for -i; zero padding cannot collide because word bytes are never 0) and
+ * probed in a small open-addressed table of keys.  A length mask rejects tokens whose
+ * length no pattern has before any hashing.  Longer tokens use the byte-wise table. */
+static unsigned char wcls[256];             /* 0 = separator, 1 = word byte, 2 = non-ASCII */
+static uint64_t *ws8; static size_t ws8_mask; static int ws8_shift;
+static uint64_t ws_lenmask;                 /* bit n: some pattern has length n (n < 63); bit 63: longer */
+static int ws_fast;
+static inline uint64_t ws_fold8(uint64_t w)
 {
-    size_t i = 0;
-    while (i < n) {
-        unsigned char c = (unsigned char)l[i];
-        if (c >= 0x80) return -1;
-        if (!isw(c)) { i++; continue; }
-        size_t j = i + 1;
-        while (j < n && isw((unsigned char)l[j])) j++;
-        if (j < n && (unsigned char)l[j] >= 0x80) return -1;
-        const char *tok = l + i;
-        size_t tn = j - i;
+    const uint64_t H = 0x8080808080808080ULL, L7 = 0x7F7F7F7F7F7F7F7FULL;
+    uint64_t t1 = (w & L7) + 0x3F3F3F3F3F3F3F3FULL;      /* bit 7 set when byte >= 'A' */
+    uint64_t t2 = (w & L7) + 0x2525252525252525ULL;      /* bit 7 set when byte >= '[' */
+    return w | (((t1 & ~t2) & ~w & H) >> 2);
+}
+static void wset_fast_init(void)
+{
+    for (int c = 0; c < 256; c++) wcls[c] = c >= 0x80 ? 2 : (isw((unsigned char)c) ? 1 : 0);
+    size_t n8 = 0;
+    ws_lenmask = 0;
+    for (size_t h = 0; h < ws_cap; h++) {
+        if (!ws_lit[h]) continue;
+        ws_lenmask |= 1ULL << (ws_len[h] < 63 ? ws_len[h] : 63);
+        if (ws_len[h] <= 8) n8++;
+    }
+    size_t cap = 16; int sh = 60;
+    while (cap < n8 * 4) { cap <<= 1; sh--; }
+    ws8 = calloc(cap, sizeof *ws8);
+    if (!ws8) die("out of memory");
+    ws8_mask = cap - 1; ws8_shift = sh;
+    for (size_t h = 0; h < ws_cap; h++) {
+        if (!ws_lit[h] || ws_len[h] > 8) continue;
+        uint64_t key = 0;
+        for (size_t k = 0; k < ws_len[h]; k++) key |= (uint64_t)(unsigned char)ws_lit[h][k] << (8 * k);
+        size_t i = (size_t)((key * 0x9E3779B97F4A7C15ULL) >> ws8_shift);
+        while (ws8[i]) i = (i + 1) & ws8_mask;
+        ws8[i] = key;
+    }
+    ws_fast = 1;
+}
+static int wset_check_scalar(const char *l, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)l, *e = p + n;
+    while (p < e) {
+        unsigned t = wcls[*p];
+        if (t == 0) { p++; continue; }
+        if (t == 2) return -1;
+        const unsigned char *j = p + 1;
+        while (j < e && wcls[*j] == 1) j++;
+        if (j < e && wcls[*j] == 2) return -1;
+        size_t tn = (size_t)(j - p);
+        if (!((ws_lenmask >> (tn < 63 ? tn : 63)) & 1)) { p = j; continue; }
+        if (tn <= 8) {
+            uint64_t w;
+            if ((size_t)(e - p) >= 8) {
+                memcpy(&w, p, 8);
+                if (tn < 8) w &= (1ULL << (8 * tn)) - 1;
+            } else {
+                w = 0;
+                for (size_t k = 0; k < tn; k++) w |= (uint64_t)p[k] << (8 * k);
+            }
+            if (ws_icase) w = ws_fold8(w);
+            size_t h = (size_t)((w * 0x9E3779B97F4A7C15ULL) >> ws8_shift);
+            for (uint64_t k; (k = ws8[h]) != 0; h = (h + 1) & ws8_mask)
+                if (k == w) return 1;
+            p = j;
+            continue;
+        }
+        const char *tok = (const char *)p;
         char buf[512];
         if (ws_icase) {
             if (tn >= sizeof buf) return -1;
             for (size_t k = 0; k < tn; k++) {
-                unsigned char x = (unsigned char)tok[k];
+                unsigned char x = p[k];
                 buf[k] = (x >= 'A' && x <= 'Z') ? (char)(x | 0x20) : (char)x;
             }
             tok = buf;
@@ -1642,9 +1706,105 @@ static int wset_check(const char *l, size_t n)
             if (ws_len[h] == tn && !memcmp(ws_lit[h], tok, tn)) return 1;
             h = (h + 1) & (ws_cap - 1);
         }
-        i = j;
+        p = j;
     }
     return 0;
+}
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+/* One token [s, s+tn): 1 if it is in the set. */
+static inline int ws_probe(const unsigned char *s, size_t tn, const unsigned char *e)
+{
+    if (!((ws_lenmask >> (tn < 63 ? tn : 63)) & 1)) return 0;
+    if (tn <= 8) {
+        uint64_t w;
+        if ((size_t)(e - s) >= 8) { memcpy(&w, s, 8); if (tn < 8) w &= (1ULL << (8 * tn)) - 1; }
+        else { w = 0; for (size_t k = 0; k < tn; k++) w |= (uint64_t)s[k] << (8 * k); }
+        if (ws_icase) w = ws_fold8(w);
+        size_t h = (size_t)((w * 0x9E3779B97F4A7C15ULL) >> ws8_shift);
+        for (uint64_t k; (k = ws8[h]) != 0; h = (h + 1) & ws8_mask)
+            if (k == w) return 1;
+        return 0;
+    }
+    const char *tok = (const char *)s;
+    char buf[512];
+    if (ws_icase) {
+        if (tn >= sizeof buf) return -1;
+        for (size_t k = 0; k < tn; k++) { unsigned char x = s[k]; buf[k] = (x >= 'A' && x <= 'Z') ? (char)(x | 0x20) : (char)x; }
+        tok = buf;
+    }
+    size_t h = ws_hash(tok, tn) & (ws_cap - 1);
+    while (ws_lit[h]) {
+        if (ws_len[h] == tn && !memcmp(ws_lit[h], tok, tn)) return 1;
+        h = (h + 1) & (ws_cap - 1);
+    }
+    return 0;
+}
+__attribute__((target("avx2")))
+static inline void ws_masks(const unsigned char *p, uint64_t *wm, uint64_t *hm)
+{
+    const __m256i c0 = _mm256_set1_epi8('0'), c9 = _mm256_set1_epi8(9);
+    const __m256i cA = _mm256_set1_epi8('A'), c25 = _mm256_set1_epi8(25);
+    const __m256i ca = _mm256_set1_epi8('a'), cu = _mm256_set1_epi8('_');
+    uint32_t w2[2], h2[2];
+    for (int k = 0; k < 2; k++) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(p + 32 * k));
+        __m256i d = _mm256_sub_epi8(v, c0), u = _mm256_sub_epi8(v, cA), lw = _mm256_sub_epi8(v, ca);
+        __m256i r = _mm256_cmpeq_epi8(_mm256_min_epu8(d, c9), d);
+        r = _mm256_or_si256(r, _mm256_cmpeq_epi8(_mm256_min_epu8(u, c25), u));
+        r = _mm256_or_si256(r, _mm256_cmpeq_epi8(_mm256_min_epu8(lw, c25), lw));
+        r = _mm256_or_si256(r, _mm256_cmpeq_epi8(v, cu));
+        w2[k] = (uint32_t)_mm256_movemask_epi8(r);
+        h2[k] = (uint32_t)_mm256_movemask_epi8(v);
+    }
+    *wm = (uint64_t)w2[0] | ((uint64_t)w2[1] << 32);
+    *hm = (uint64_t)h2[0] | ((uint64_t)h2[1] << 32);
+}
+__attribute__((target("avx2")))
+static int wset_check_avx2(const char *l, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)l, *e = p + n;
+    size_t ts = (size_t)-1;                         /* start of a token still open at the block end */
+    for (size_t base = 0; base < n; base += 64) {
+        unsigned char tmp[64];
+        const unsigned char *blk = p + base;
+        if (base + 64 > n) { memset(tmp, 0, 64); memcpy(tmp, blk, n - base); blk = tmp; }
+        uint64_t m, hm;
+        ws_masks(blk, &m, &hm);
+        if (hm) return -1;
+        if (ts != (size_t)-1) {
+            if (m == ~0ULL) continue;                       /* the open token runs through this block */
+            unsigned run = (unsigned)__builtin_ctzll(~m);
+            int r = ws_probe(p + ts, base + run - ts, e);
+            if (r) return r;
+            ts = (size_t)-1;
+            /* run == 0: this block starts on a separator. << 0 would clear the mask. */
+            if (run) m &= ~0ULL << run;
+        }
+        while (m) {
+            unsigned s = (unsigned)__builtin_ctzll(m);
+            uint64_t rest = ~(m >> s);
+            unsigned run = (unsigned)__builtin_ctzll(rest);
+            if (s + run >= 64) { ts = base + s; break; }
+            int r = ws_probe(p + base + s, run, e);
+            if (r) return r;
+            m &= ~0ULL << (s + run);
+        }
+    }
+    if (ts != (size_t)-1) return ws_probe(p + ts, n - ts, e);
+    return 0;
+}
+static int ws_avx2_ok = -1;
+#endif
+/* 1 = some token is a pattern, 0 = none, -1 = line has non-ASCII bytes: ask the regex */
+static int wset_check(const char *l, size_t n)
+{
+#if defined(__x86_64__)
+    if (ws_avx2_ok < 0) ws_avx2_ok = __builtin_cpu_supports("avx2") ? 1 : 0;
+    if (ws_avx2_ok) return wset_check_avx2(l, n);
+#endif
+    return wset_check_scalar(l, n);
 }
 
 /* ---- literal-set spans for -o / --color ------------------------------------
@@ -1837,13 +1997,74 @@ static int wcheck(const char *l, size_t n)          /* exact -w verification */
 }
 
 static int wdfa_on;
+/* -w on a line with non-ASCII bytes.  When every pattern atom is a plain ASCII set
+ * (no non-ASCII literal, no negated class, no [:class:] or \w), a multibyte character
+ * only matters as a word or non-word neighbour.  Each UTF-8 character is mapped to one
+ * placeholder byte that no pattern atom accepts (a word byte for letters and digits, a
+ * control byte for the rest) and the same DFA decides the line.  Anything else, and
+ * invalid UTF-8, goes to libc as before. */
+static int uni_ok;
+static unsigned char uni_W, uni_N;
+static void uni_setup(void)
+{
+    uni_ok = 0;
+    if (!(wflag && wdfa_on && !wset_on && mb_locale && !iflag && !mb_class_used && engine == ENG_DFA)) return;
+    for (size_t i = 0; i < npat; i++)
+        for (size_t k = 0; k < fxlen[i]; k++) if ((unsigned char)fx[i][k] >= 0x80) return;
+    uint64_t nw[4] = {0, 0, 0, 0}, un[4] = {0, 0, 0, 0};
+    for (int ch = 0; ch < 128; ch++) if (!isalnum(ch) && ch != '_') nw[ch >> 6] |= 1ULL << (ch & 63);
+    for (int q = 0; q < nnfa; q++) {
+        if (nfa[q].type != 0) continue;
+        if (!memcmp(nfa[q].set, nw, sizeof nw)) continue;   /* the boundary atom itself */
+        for (int w = 0; w < 4; w++) un[w] |= nfa[q].set[w];
+    }
+    int W = -1, N = -1;
+    for (int ch = 0; ch < 128 && W < 0; ch++) if ((isalnum(ch) || ch == '_') && !hasbit(un, ch)) W = ch;
+    for (int ch = 1; ch < 32 && N < 0; ch++) if (!hasbit(un, ch)) N = ch;
+    if (W < 0 || N < 0) return;
+    uni_W = (unsigned char)W; uni_N = (unsigned char)N;
+    uni_ok = 1;
+}
+static void matcher_init(Matcher *M);
+static int dfa_match(Matcher *M, const unsigned char *p, size_t n);
+static __thread Matcher *tl_um;                      /* private tables: never disturbs a streaming matcher */
+static __thread unsigned char *tl_ubuf; static __thread size_t tl_ucap;
+static int uni_match(const char *l, size_t n)        /* 1 / 0, or -1: ask libc */
+{
+    if (tl_ucap < n + 1) { tl_ubuf = xrealloc(tl_ubuf, n + 64); tl_ucap = n + 64; }
+    const unsigned char *p = (const unsigned char *)l;
+    size_t o = 0;
+    for (size_t i = 0; i < n;) {
+        unsigned c = p[i];
+        if (c < 0x80) { tl_ubuf[o++] = (unsigned char)c; i++; continue; }
+        uint32_t cp; size_t k;
+        if (c >= 0xC2 && c <= 0xDF && i + 1 < n && (p[i + 1] & 0xC0) == 0x80) {
+            cp = ((c & 0x1Fu) << 6) | (p[i + 1] & 0x3Fu); k = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < n && (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80) {
+            cp = ((c & 0x0Fu) << 12) | ((p[i + 1] & 0x3Fu) << 6) | (p[i + 2] & 0x3Fu); k = 3;
+            if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) return -1;
+        } else if (c >= 0xF0 && c <= 0xF4 && i + 3 < n && (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80 && (p[i + 3] & 0xC0) == 0x80) {
+            cp = ((c & 0x07u) << 18) | ((p[i + 1] & 0x3Fu) << 12) | ((p[i + 2] & 0x3Fu) << 6) | (p[i + 3] & 0x3Fu); k = 4;
+            if (cp < 0x10000 || cp > 0x10FFFF) return -1;
+        } else return -1;
+        tl_ubuf[o++] = iswalnum((wint_t)cp) ? uni_W : uni_N;
+        i += k;
+    }
+    if (!tl_um) { tl_um = xrealloc(NULL, sizeof *tl_um); matcher_init(tl_um); }
+    return dfa_match(tl_um, tl_ubuf, o);
+}
+static int hi_check(const char *l, size_t n)         /* a -w line that has bytes >= 0x80 */
+{
+    if (uni_ok) { int r = uni_match(l, n); if (r >= 0) return r; }
+    return wcheck(l, n);
+}
 static inline int has_high_byte(const char *l, size_t n);
 static int line_matches_base(const char *l, size_t n, Matcher *M);
 static int line_matches(const char *l, size_t n, Matcher *M)
 {
     if (wset_on) return wcheck(l, n);               /* token lookup is exact by itself */
     if (wdfa_on) {                                  /* bounded DFA is exact for ASCII lines */
-        if (mb_locale && has_high_byte(l, n)) return wcheck(l, n);
+        if (mb_locale && has_high_byte(l, n)) return hi_check(l, n);
         return dfa_match(M, (const unsigned char *)l, n);
     }
     int r = line_matches_base(l, n, M);
@@ -3055,6 +3276,17 @@ static size_t dfa4_run(const uint16_t *restrict sf,
     *term = 0;
     return i;
 }
+/* A byte >= 0x80 under -w in a multibyte locale: the DFA is only exact for ASCII
+ * lines, so the whole line is decided by libc, as line_matches() does. */
+static int hi_check(const char *l, size_t n);
+static void stream_hi_line(const char *d, Matcher *M, Strm *x, SCtx *cx, MList *l)
+{
+    size_t ls = line_start_before(d, x->lo, x->p - 1);
+    size_t le = line_end_from(d, x->p, x->end);
+    if (hi_check(d + ls, le - ls)) s_hit(cx, l, ls, le);
+    x->p = le < x->end ? le + 1 : x->end;
+    x->ls = x->p; x->s = M->init;
+}
 static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash, SCtx *cx, MList *l)
 {
     const uint16_t init = M->init;
@@ -3062,7 +3294,7 @@ static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash, SCt
         size_t pos = x->ls;
         while (pos < x->end) {
             size_t le = line_end_from(d, pos, x->end);
-            if (dfa_match(M, (const unsigned char *)d + pos, le - pos)) s_hit(cx, l, pos, le);
+            if (wflag ? line_matches(d + pos, le - pos, M) : dfa_match(M, (const unsigned char *)d + pos, le - pos)) s_hit(cx, l, pos, le);
             pos = le < x->end ? le + 1 : x->end;
         }
         return 0;
@@ -3081,6 +3313,11 @@ static size_t stream_scalar(const char *d, Matcher *M, Strm *x, int *thrash, SCt
         if (t == NLV) {
             if (M->ds[s].endacc) s_hit(cx, l, line_start_before(d, x->lo, p - 1), p - 1);
             s = init; inline_ = 0; ls = p; continue;
+        }
+        if (t == HIV) {
+            x->p = p;
+            stream_hi_line(d, M, x, cx, l);
+            p = x->p; s = init; inline_ = 0; ls = p; continue;
         }
         if (t == UNK) {
             t = compute(M, s, b);
@@ -3145,6 +3382,7 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
                 if (M->ds[x->s].endacc) s_hit(&cx, &ml[k], line_start_before(d, x->lo, x->p - 1), x->p - 1);
                 x->s = init; x->ls = x->p; continue;
             }
+            if (t == HIV) { stream_hi_line(d, M, x, &cx, &ml[k]); continue; }
             if (t == UNK) {
                 unsigned char b = d[x->p - 1];
                 uint32_t ep = M->epoch;
@@ -3168,7 +3406,14 @@ static void stream_range(Chunk *c, Matcher *M, size_t begin, size_t end)
             x->ls = x->p; x->s = init;
         }
     }
-    for (int k = 0; k < K; k++) stream_scalar(d, M, &st[k], &thrash, &cx, &ml[k]);
+    const uint32_t ep_sc = M->epoch;
+    for (int k = 0; k < K; k++) {
+        if (M->epoch != ep_sc) {                    /* an earlier stream reset the cache: this stream's state id is stale */
+            st[k].ls = line_start_before(d, st[k].lo, st[k].p);
+            st[k].p = st[k].ls; st[k].s = init;
+        }
+        stream_scalar(d, M, &st[k], &thrash, &cx, &ml[k]);
+    }
 
     /* ---- results in file order ---- */
     size_t matched = cx.count, cnt = 0, cnt_pos = begin;
@@ -3976,14 +4221,42 @@ static void open_fail(FileJob *j, const char *name, int fd)
     if (fd > 0) close(fd);
     job_done(j);
 }
+/* A regular file from the walk is read straight through. One fstat per file
+ * dominated the directory search. Returns 1 when the job is finished. */
+static int read_known(FileJob *j, Matcher *M, int fd)
+{
+    size_t cap = SMALL_MAX + 1, n = 0;
+    if (M->fcap < cap) { M->fcap = cap; M->fbuf = xrealloc(M->fbuf, M->fcap); }
+    while (n < cap) {
+        ssize_t r = read(fd, M->fbuf + n, cap - n);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EISDIR) j->isdir = 1;
+            open_fail(j, j->name, fd);
+            return 1;
+        }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    if (n <= SMALL_MAX) {
+        if (fd > 0) close(fd);
+        process_small(j, M, M->fbuf, n);
+        job_done(j);
+        return 1;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) { open_fail(j, j->name, fd); return 1; }
+    return 0;                                       /* larger than SMALL_MAX: mmap path */
+}
 static void open_job(FileJob *j, Matcher *M)
 {
     const char *name = j->name;
     int is_stdin = !strcmp(name, "-");
     int fd = is_stdin ? 0 : open(name, O_RDONLY);
-    int ok = fd >= 0;
+    if (fd < 0) { open_fail(j, name, fd); return; }
+    if (!is_stdin && j->known_reg && read_known(j, M, fd)) return;
+    int ok = 1;
     struct stat st;
-    if (ok && fstat(fd, &st) != 0) ok = 0;
+    if (fstat(fd, &st) != 0) ok = 0;
     if (ok && !is_stdin && S_ISDIR(st.st_mode)) { errno = EISDIR; j->isdir = 1; ok = 0; }
     if (!ok) { open_fail(j, name, fd); return; }
     if (is_stdin) j->name = label ? label : "(standard input)";
@@ -4144,9 +4417,13 @@ static void *printer(void *arg)
     size_t cap_total = (size_t)-1;                  /* stop scanning a file after this many hits */
     if (maxcount >= 0) cap_total = (size_t)maxcount;
     if (lflag || Lflag || qflag) cap_total = 1;
-    for (size_t i = 0; i < nfiles; i++) {
+    for (size_t i = 0;; i++) {
         pthread_mutex_lock(&mu);
-        while (!jobs[i] || !jobs[i]->done) pthread_cond_wait(&done_cv, &mu);
+        for (;;) {
+            if (i < nfiles && jobs && jobs[i] && jobs[i]->done) break;
+            if (feed_done && i >= nfiles) { pthread_mutex_unlock(&mu); free(pb.p); return NULL; }
+            pthread_cond_wait(&done_cv, &mu);
+        }
         pthread_mutex_unlock(&mu);
         FileJob *j = jobs[i];
         if (j->failed) {
@@ -4249,8 +4526,35 @@ static void *printer(void *arg)
 /* ================= file list: -r, --include/--exclude ================= */
 
 static char **flist, **inc, **exc, **excdir;
+static unsigned char *freg;          /* parallel to flist: 1 if the walk saw a regular file */
 static size_t nflist, cflist, ninc, nexc, nexcdir;
-static int recursed_dir;
+static int recursed_dir, live_feed;
+static size_t jobs_cap;
+/* Publish one more file while workers are already running. The name must
+ * stay allocated for the life of the process. */
+static void append_job(const char *name, int known_reg)
+{
+    FileJob *j = calloc(1, sizeof *j);
+    Chunk *ot = calloc(1, sizeof *ot);
+    if (!j || !ot) die("out of memory");
+    j->name = name;
+    j->known_reg = known_reg;
+    j->ot = ot;
+    ot->job = j;
+    ot->is_open = 1;
+    pthread_mutex_lock(&mu);
+    while (nfiles - printed >= window) pthread_cond_wait(&slot_cv, &mu);
+    if (nfiles == jobs_cap) {
+        jobs_cap = jobs_cap ? jobs_cap * 2 : 64;
+        jobs = xrealloc(jobs, jobs_cap * sizeof *jobs);
+    }
+    jobs[nfiles++] = j;
+    if (qtail) qtail->next = ot; else qhead = ot;
+    qtail = ot;
+    pthread_cond_signal(&q_cv);
+    pthread_cond_broadcast(&done_cv);
+    pthread_mutex_unlock(&mu);
+}
 
 static void strv_add(char ***v, size_t *n, const char *s)
 {
@@ -4274,10 +4578,40 @@ static int file_wanted(const char *path)
     if (ninc && !glob_any(inc, ninc, path)) return 0;
     return 1;
 }
-static void flist_add(const char *p)
+static void flist_add(const char *p, int known_reg)
 {
-    if (nflist == cflist) { cflist = cflist ? cflist * 2 : 64; flist = xrealloc(flist, cflist * sizeof *flist); }
-    flist[nflist++] = strdup(p);
+    if (nflist == cflist) {
+        cflist = cflist ? cflist * 2 : 64;
+        flist = xrealloc(flist, cflist * sizeof *flist);
+        freg = xrealloc(freg, cflist);
+    }
+    flist[nflist] = strdup(p);
+    freg[nflist] = (unsigned char)known_reg;
+    nflist++;
+    if (live_feed) append_job(flist[nflist - 1], known_reg);
+}
+#ifndef DT_UNKNOWN
+#define DT_UNKNOWN 0
+#define DT_DIR 4
+#define DT_REG 8
+#define DT_LNK 10
+#endif
+/* 1 regular, 2 directory, 0 skip, -1 stat error. d_type avoids an lstat on
+ * filesystems that fill it in. DT_UNKNOWN and a followed symlink still stat. */
+static int entry_kind(const char *path, unsigned char dtype)
+{
+#ifdef _DIRENT_HAVE_D_TYPE
+    if (dtype == DT_REG) return 1;
+    if (dtype == DT_DIR) return 2;
+    if (dtype != DT_UNKNOWN && !(deref && dtype == DT_LNK)) return 0;
+#else
+    (void)dtype;
+#endif
+    struct stat st;
+    if ((deref ? stat(path, &st) : lstat(path, &st)) != 0) return -1;
+    if (S_ISREG(st.st_mode)) return 1;
+    if (S_ISDIR(st.st_mode)) return 2;
+    return 0;
 }
 static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
@@ -4294,44 +4628,51 @@ static void walk_dir(const char *dir, int depth)    /* dir == "" means the curre
         had_error = 1;
         return;
     }
-    char **names = NULL;
-    size_t nn = 0;
+    typedef struct { char *name; unsigned char dtype; } Ent;
+    Ent *ents = NULL;
+    size_t nn = 0, ecap = 0;
     struct dirent *de;
     while ((de = readdir(d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        strv_add(&names, &nn, de->d_name);
+        if (nn == ecap) { ecap = ecap ? ecap * 2 : 32; ents = xrealloc(ents, ecap * sizeof *ents); }
+        ents[nn].name = strdup(de->d_name);
+#ifdef _DIRENT_HAVE_D_TYPE
+        ents[nn].dtype = de->d_type;
+#else
+        ents[nn].dtype = DT_UNKNOWN;
+#endif
+        nn++;
     }
     closedir(d);
-    qsort(names, nn, sizeof *names, cmp_str);       /* deterministic order */
+    qsort(ents, nn, sizeof *ents, cmp_str);         /* deterministic order; name is the first field */
     size_t dl = strlen(dir);
     for (size_t i = 0; i < nn; i++) {
-        size_t nl = strlen(names[i]);
+        size_t nl = strlen(ents[i].name);
         char *child = xrealloc(NULL, dl + nl + 2);
-        if (dl == 0) memcpy(child, names[i], nl + 1);
+        if (dl == 0) memcpy(child, ents[i].name, nl + 1);
         else {
             memcpy(child, dir, dl);
             size_t o = dl;
             if (dir[dl - 1] != '/') child[o++] = '/';
-            memcpy(child + o, names[i], nl + 1);
+            memcpy(child + o, ents[i].name, nl + 1);
         }
-        struct stat st;
-        int rc = deref ? stat(child, &st) : lstat(child, &st);
-        if (rc) {
+        int k = entry_kind(child, ents[i].dtype);
+        if (k < 0) {
             if (!sflag) fprintf(stderr, "%s: %s: %s\n", prog, child, strerror(errno));
             had_error = 1;
-        } else if (S_ISDIR(st.st_mode)) {
-            if (!(nexcdir && glob_any(excdir, nexcdir, names[i]))) walk_dir(child, depth + 1);
-        } else if (S_ISREG(st.st_mode)) {
-            if (file_wanted(child)) flist_add(child);
+        } else if (k == 2) {
+            if (!(nexcdir && glob_any(excdir, nexcdir, ents[i].name))) walk_dir(child, depth + 1);
+        } else if (k == 1) {
+            if (file_wanted(child)) flist_add(child, 1);
         }
         free(child);
-        free(names[i]);
+        free(ents[i].name);
     }
-    free(names);
+    free(ents);
 }
 static void add_operand(const char *p)
 {
-    if (!strcmp(p, "-")) { flist_add(p); return; }
+    if (!strcmp(p, "-")) { flist_add(p, 0); return; }
     struct stat st;
     if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
         if (rflag) { recursed_dir = 1; walk_dir(p, 0); return; }
@@ -4339,7 +4680,7 @@ static void add_operand(const char *p)
     } else if (!file_wanted(p)) {
         return;
     }
-    flist_add(p);
+    flist_add(p, 0);
 }
 
 /* ================= main ================= */
@@ -4465,8 +4806,8 @@ static void print_help(void)
 "  -L, --files-without-match print only names of FILEs with no selected lines\n"
 "  -l, --files-with-matches  print only names of FILEs with selected lines\n"
 "  -c, --count               print only a count of selected lines per FILE\n"
-"      --color[=WHEN], --colour[=WHEN]  use markers to highlight matches;\n"
-"                            WHEN is 'always', 'never', or 'auto'\n"
+"      --color[=WHEN], --colour[=WHEN]  highlight matches; WHEN is 'always',\n"
+"                            'never', or 'auto' (default: auto)\n"
 "  -Z, --null                print 0 byte after FILE name\n\n"
 "Context control:\n"
 "  -B, --before-context=NUM  print NUM lines of leading context\n"
@@ -4479,7 +4820,7 @@ static void print_help(void)
 }
 static void print_version(void)
 {
-    printf("%s 1.3.2\nA multi-threaded POSIX/GNU-style grep.\n", prog);
+    printf("%s 1.3.3\nA multi-threaded POSIX/GNU-style grep.\n", prog);
 }
 static long parse_num(const char *s, const char *what)
 {
@@ -4570,7 +4911,7 @@ static int mlit_filter_worth(void)
 int main(int argc, char **argv)
 {
     long nthreads = default_thread_count();
-    int have_pat = 0, opt, color_mode = 0;          /* 0 never, 1 always, 2 auto */
+    int have_pat = 0, opt, color_mode = 2;          /* 0 never, 1 always, 2 auto */
     long dctx = -1, digits = 0;
     int last_digit_cur = -1, last_was_digit = 0;
     prog = progname(argv[0]);
@@ -4694,13 +5035,24 @@ int main(int argc, char **argv)
                                    strcmp(getenv("TERM"), "dumb"));
     if (color_on) color_init();
 
-    /* the file list */
+    /* the file list. A recursive walk is deferred until workers are up, so
+     * opening files overlaps readdir. Large literal sets still walk first:
+     * the anchor sample reads the first file inside wm_build. */
     int noperands = argc - optind;
-    if (rflag && optind >= argc) { recursed_dir = 1; walk_dir("", 0); }
-    else if (optind >= argc) flist_add("-");
+    int opt_base = optind;
+    int defer_walk = 0;
+    if (rflag && optind >= argc) defer_walk = 1;
+    else if (rflag) {
+        for (int i = optind; i < argc; i++) {
+            struct stat st;
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) { defer_walk = 1; break; }
+        }
+    }
+    if (defer_walk) recursed_dir = 1;
+    else if (optind >= argc) flist_add("-", 0);
     else for (int i = optind; i < argc; i++) add_operand(argv[i]);
     files = (const char **)flist;
-    nfiles = nflist;
+    if (!defer_walk) nfiles = nflist;
     store_matches = !(cflag || lflag || Lflag || qflag);
     /* One worker already overlaps search with the printer. Formatting in that
      * worker removes the overlap and is slower. Several workers format at once. */
@@ -4744,7 +5096,7 @@ int main(int argc, char **argv)
             }
             /* Dense common-word sets stay on the DFA. Sparse sets keep the
              * folded literal scanners. */
-            if (mlit_filter_worth() && (!wflag || words)) {
+            if ((wflag && words) || (mlit_filter_worth() && !wflag)) {
                 if (wflag) {
                     char **ps = xrealloc(NULL, nmlit * sizeof *ps);
                     size_t *ls = xrealloc(NULL, nmlit * sizeof *ls);
@@ -4905,7 +5257,21 @@ int main(int argc, char **argv)
         teddy_build();
 #endif
     if (engine == ENG_DFA && !vflag && !lit && nmlit == 0) fb_setup();
-    stream_ok = engine == ENG_DFA && !(vflag && qflag) && !wflag && !mb_class_used && !fb_on && !lit && nmlit == 0;
+    uni_setup();
+    if (getenv("CG_NOUNI")) uni_ok = 0;              /* diagnostic: non-ASCII -w lines go to libc */
+    stream_hi = wflag && wdfa_on && !wset_on && mb_locale;
+    stream_ok = engine == ENG_DFA && !(vflag && qflag) && (!wflag || (wdfa_on && !wset_on && !getenv("CG_NOSTREAMW"))) && !mb_class_used && !fb_on && !lit && nmlit == 0;
+    if (defer_walk && nmlit > TEDDY_LIMIT) {
+        size_t shortest = (size_t)-1;
+        for (size_t i = 0; i < nmlit; i++) if (mlits[i].n < shortest) shortest = mlits[i].n;
+        if (shortest >= 8) {
+            if (opt_base >= argc) walk_dir("", 0);
+            else for (int i = opt_base; i < argc; i++) add_operand(argv[i]);
+            files = (const char **)flist;
+            nfiles = nflist;
+            defer_walk = 0;
+        }
+    }
     wm_build();
     byte_class_build();
     if (!byte_class && nmlit >= 5 && !teddy_ready && !wm_ready) mh_build();
@@ -4942,8 +5308,11 @@ int main(int argc, char **argv)
 
     static char obuf[1 << 16];
     setvbuf(stdout, obuf, _IOFBF, sizeof obuf);
-    jobs = calloc(nfiles, sizeof *jobs);
-    if (!jobs) die("out of memory");
+    if (nfiles) {
+        jobs = calloc(nfiles, sizeof *jobs);
+        if (!jobs) die("out of memory");
+        jobs_cap = nfiles;
+    }
     window = (size_t)nthreads * 16 < 64 ? 64 : (size_t)nthreads * 16;
     want_name = show_name < 0 ? (noperands > 1 || recursed_dir) : show_name;
 
@@ -4957,6 +5326,7 @@ int main(int argc, char **argv)
         Chunk *ot = calloc(1, sizeof *ot);
         if (!j || !ot) die("out of memory");
         j->name = files[i];
+        j->known_reg = freg[i];
         j->ot = ot;
         ot->job = j;
         ot->is_open = 1;
@@ -4966,11 +5336,19 @@ int main(int argc, char **argv)
         if (qtail) qtail->next = ot; else qhead = ot;
         qtail = ot;
         pthread_cond_signal(&q_cv);
+        pthread_cond_broadcast(&done_cv);
         pthread_mutex_unlock(&mu);
+    }
+    if (defer_walk) {
+        live_feed = 1;
+        if (opt_base >= argc) walk_dir("", 0);
+        else for (int i = opt_base; i < argc; i++) add_operand(argv[i]);
+        live_feed = 0;
     }
     pthread_mutex_lock(&mu);
     feed_done = 1;
     pthread_cond_broadcast(&q_cv);
+    pthread_cond_broadcast(&done_cv);
     pthread_mutex_unlock(&mu);
 
     pthread_join(ptid, NULL);

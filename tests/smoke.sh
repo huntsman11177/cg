@@ -8,7 +8,7 @@ printf '%s\n' 'alpha' 'beta' 'ALPHA' 'gamma delta' 'alphabet' > "$TMP/input.txt"
 printf '%s\n' 'alpha' 'gamma' > "$TMP/patterns.txt"
 printf '%s\n' 'sub-alpha' > "$TMP/dir/sub/nested.txt"
 
-[ "$($CG --version | head -n1)" = 'cg 1.3.2' ]
+[ "$($CG --version | head -n1)" = 'cg 1.3.3' ]
 
 printf '%s\n' 'alpha' 'alphabet' > "$TMP/expected"
 $CG -F alpha "$TMP/input.txt" | diff -u "$TMP/expected" -

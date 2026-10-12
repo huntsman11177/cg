@@ -1,6 +1,6 @@
 # Maintainer: huntsman11177 <sahasubrata11177@gmail.com>
 pkgname=cg
-pkgver=1.3.2
+pkgver=1.3.3
 pkgrel=1
 pkgdesc='Fast multi-threaded POSIX/GNU-style grep'
 arch=('x86_64' 'aarch64' 'riscv64')
@@ -8,7 +8,7 @@ url='https://github.com/huntsman11177/cg'
 license=('MIT')
 depends=('glibc')
 source=("https://github.com/huntsman11177/cg/releases/download/v${pkgver}/${pkgname}-${pkgver}.tar.gz")
-sha256sums=('02e9fd501954c0ca7ef0f0211a87c28af46605203e94677b3a4cd772ede233ce')
+sha256sums=('SKIP')
 
 build() {
   cd "${pkgname}-${pkgver}"

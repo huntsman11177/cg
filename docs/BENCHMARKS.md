@@ -190,3 +190,14 @@ Same machine, powersave governor, warm `en.txt` (9968530111 bytes). `cg` 1.3.2 a
 | `-E -f HARD_REAL_10000.regex` | 11.66 s (11.81 s) | 12.16 s (12.31 s) | 2.78 s | 2.77 s | 11744376 |
 
 `th[a-z]+` is a basic expression, so `+` is literal. That is the same search GNU grep runs, and it is not the ripgrep search. ripgrep on the comparable rows in this session: `-E -w '[a-z]+ing'` 6.60 s wall (43626703 lines; ripgrep's `[a-z]` is ASCII), `-E 'a.*z'` 11.93 s wall (same 3406053 lines), `-F -i -f` 100 words 16.10 s wall (same count). No other row in the paired run was more than 3% slower in user time than 1.3.1. The literal scanners were not retuned.
+
+## 1.3.3 snapshot (2026-10-12)
+
+Same machine, powersave governor, `en.txt` (9968530111 bytes). Three rounds of `cg` 1.3.3 at `-j1 -c -E -w` after `cat en.txt >/dev/null`, timed with `/usr/bin/time` wall time. Rounds 1 and 2 of the `e` pattern were about 2.3× round 3 for every tool, so the table is round 3. `s` had already settled in round 2 (8.05 s, 20.79 s, 13.59 s, 19.30 s). ripgrep 15.2.0 is `/usr/bin/rg -j1 -c -w`.
+
+| Pattern | default | no stream | no uni | ripgrep |
+|---|---:|---:|---:|---:|
+| `[a-z]+e` | 9.57 s | 18.19 s | 14.38 s | 19.97 s |
+| `[a-z]+s` | 8.03 s | 20.53 s | 13.63 s | 19.31 s |
+
+Counts, every round: default and no-stream `e` 164108077, `s` 90951565. No-uni `e` 164124588, `s` 90965547, matching the 1.3.2 binary. ripgrep `e` 164108072, `s` 90951559. `CG_NOSTREAMW` and `CG_NOUNI` are diagnostic switches in this source and are unset by default. The literal scanners were not retuned. `HARD_REAL_10000` was not retimed.

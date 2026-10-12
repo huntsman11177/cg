@@ -6,7 +6,7 @@ The implementation combines parallel file processing with specialized literal sc
 
 ## Status
 
-Current source version: **1.3.2**.
+Current source version: **1.3.3**.
 
 This repository documentation describes the current source tree. It intentionally does not claim full GNU grep compatibility: unsupported features are called out explicitly below.
 
@@ -110,7 +110,7 @@ Common output options include:
 | `-A N` | Print N lines of trailing context |
 | `-B N` | Print N lines of leading context |
 | `-C N` | Print N lines of context |
-| `--color[=WHEN]` | Highlight matches |
+| `--color[=WHEN]` | Highlight matches. The default is `auto` (a terminal only). `--color=never` turns it off |
 | `-Z` | NUL-terminate filenames |
 
 Context can also be requested with `-NUM`.
@@ -223,7 +223,7 @@ sys=0.15
 
 That is approximately 3.8× lower wall-clock time for `cg` in that specific run.
 
-These numbers are workload-, hardware-, compiler-, cache-, and version-dependent. They are not a claim that `cg` is universally faster than ripgrep. The 1.3.2 timings, measured on the same corpus, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+These numbers are workload-, hardware-, compiler-, cache-, and version-dependent. They are not a claim that `cg` is universally faster than ripgrep. The 1.3.3 timings, measured on the same corpus, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Development
 

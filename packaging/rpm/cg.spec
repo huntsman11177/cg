@@ -1,5 +1,5 @@
 Name:           cg
-Version:        1.3.2
+Version:        1.3.3
 Release:        1%{?dist}
 Summary:        Fast multi-threaded POSIX/GNU-style grep
 
@@ -31,11 +31,13 @@ make check
 
 %files
 %license LICENSE
-%doc README.md CHANGELOG.md RELEASE_NOTES_1.3.2.md
+%doc README.md CHANGELOG.md RELEASE_NOTES_1.3.3.md
 %{_bindir}/cg
 %{_mandir}/man1/cg.1*
 
 %changelog
+* Mon Oct 12 2026 huntsman11177 <sahasubrata11177@gmail.com> - 1.3.3-1
+- Package cg 1.3.3.
 * Sun Oct 11 2026 huntsman11177 <sahasubrata11177@gmail.com> - 1.3.2-1
 - Package cg 1.3.2.
 * Sat Oct 10 2026 huntsman11177 <sahasubrata11177@gmail.com> - 1.3.1-1

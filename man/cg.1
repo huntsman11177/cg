@@ -1,4 +1,4 @@
-.TH CG 1 "October 2026" "cg 1.3.2" "User Commands"
+.TH CG 1 "October 2026" "cg 1.3.3" "User Commands"
 .SH NAME
 cg \- fast multi-threaded POSIX/GNU-style grep implementation
 .SH SYNOPSIS
@@ -92,6 +92,14 @@ Highlight matches using markers. WHEN may be
 .BR always ,
 .BR never , or
 .BR auto .
+The default is
+.BR auto :
+highlight when standard output is a terminal and
+.B TERM
+is set and not
+.BR dumb .
+.B --color=never
+turns highlighting off.
 The spelling
 .B --colour
 is also accepted.

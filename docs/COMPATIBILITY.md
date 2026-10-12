@@ -33,7 +33,7 @@ The current help text exposes:
 - `-L`, `--files-without-match`
 - `-m`, `--max-count`
 - `--line-buffered`
-- `--color` / `--colour`
+- `--color` / `--colour` (default `auto`; GNU grep defaults to `never`)
 - `-Z`, `--null`
 
 ### Binary handling
